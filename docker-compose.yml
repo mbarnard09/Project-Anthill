@@ -4,10 +4,10 @@ services:
     build: .
     container_name: reddit1
     restart: always
-    env_file: .env
+    env_file: anthill.env
     environment:
       SERVICE_NAME: reddit1
-      SUBREDDITS: ${SUBREDDITS_STOCKS}
+      SUBREDDITS_CONFIG_PATH: config/reddit1.subreddits.yml
     command: ["python","-m","services.reddit1.main"]
     healthcheck:
       test: ["CMD","python","-c","import sys; sys.exit(0)"]
@@ -19,7 +19,7 @@ services:
     build: .
     container_name: reddit2
     restart: always
-    env_file: .env
+    env_file: anthill.env
     environment:
       SERVICE_NAME: reddit2
       SUBREDDITS: ${SUBREDDITS_CRYPTO}
@@ -34,7 +34,7 @@ services:
     build: .
     container_name: stocktwits
     restart: always
-    env_file: .env
+    env_file: anthill.env
     environment:
       SERVICE_NAME: stocktwits
     command: ["python","-m","services.stocktwits.main"]
@@ -48,7 +48,7 @@ services:
     build: .
     container_name: fourchan
     restart: always
-    env_file: .env
+    env_file: anthill.env
     environment:
       SERVICE_NAME: fourchan
       FOURCHAN_BOARDS: ${FOURCHAN_BOARDS}

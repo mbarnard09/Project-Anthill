@@ -7,6 +7,7 @@ COPY --chown=app:app requirements.txt .
 RUN pip install -r requirements.txt
 COPY --chown=app:app core /app/core
 COPY --chown=app:app services /app/services
+COPY --chown=app:app config /app/config
 # default command overridden by docker-compose
 CMD ["python","-m","services.reddit1.main"]
 
