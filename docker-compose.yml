@@ -22,7 +22,7 @@ services:
     env_file: anthill.env
     environment:
       SERVICE_NAME: reddit2
-      SUBREDDITS: ${SUBREDDITS_CRYPTO}
+      SUBREDDITS_CONFIG_PATH: config/reddit2.subreddits.yml
     command: ["python","-m","services.reddit2.main"]
     healthcheck:
       test: ["CMD","python","-c","import sys; sys.exit(0)"]
