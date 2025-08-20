@@ -13,7 +13,7 @@ from psycopg import Connection
 from psycopg import connect
 from psycopg.rows import dict_row
 
-from openai import OpenAI
+from openai import OpenAI, APIError
 
 from core.config import Settings
 from core.logging import info, err
@@ -69,13 +69,23 @@ def make_reddit_client(s: Settings) -> praw.Reddit:
     client_secret = ""  # force installed-app flow
     if not s.REDDIT_REFRESH_TOKEN:
         raise RuntimeError("Missing REDDIT_REFRESH_TOKEN")
-    reddit = praw.Reddit(
-        client_id=s.REDDIT_CLIENT_ID,
-        client_secret=client_secret,
-        user_agent=s.REDDIT_USER_AGENT,
-        refresh_token=s.REDDIT_REFRESH_TOKEN,
-    )
-    return reddit
+    
+    try:
+        reddit = praw.Reddit(
+            client_id=s.REDDIT_CLIENT_ID,
+            client_secret=client_secret,
+            user_agent=s.REDDIT_USER_AGENT,
+            refresh_token=s.REDDIT_REFRESH_TOKEN,
+        )
+        reddit.user.me()  # Preflight auth check
+        info("reddit_auth_successful")
+        return reddit
+    except prawcore.exceptions.PrawcoreException as e:
+        err("reddit_auth_failed", error=str(e))
+        raise  # Re-raise after logging
+    except Exception as e:
+        err("reddit_client_init_failed", error=str(e))
+        raise
 
 
 def fetch_alias_map(conn: Connection) -> Tuple[dict, dict, dict, dict, Set[str]]:
@@ -330,9 +340,12 @@ def score_sentiment_llm(client: OpenAI, model: str, body: str, symbol: str | Non
             return -1, "Bearish"          # Negative sentiment
         return 0, "Neutral"               # Default/neutral sentiment
         
-    except Exception as e:
-        err("openai_error", error=str(e))
+    except APIError as e:
+        err("openai_api_error", error=str(e), status_code=e.status_code, error_type=e.type)
         return 0, "Neutral"               # Fallback on API error
+    except Exception as e:
+        err("openai_unhandled_error", error=str(e))
+        return 0, "Neutral"               # Fallback on other errors
 
 
 def load_sources(conn: Connection) -> dict:
@@ -357,6 +370,90 @@ def insert_comment(conn: Connection, asset_id: int, source_id: int, commented_at
         )
 
 
+def process_comment(
+    comment: praw.models.Comment,
+    conn: Connection,
+    openai_client: OpenAI,
+    model: str,
+    alias_to_asset: Dict,
+    ticker_to_asset: Dict,
+    multi_alias_index: Dict,
+    aliases_equal_ticker: Set,
+    source_name_to_id: Dict,
+    asset_id_to_ticker: Dict,
+):
+    """Process a single comment: detect mentions, classify, and insert."""
+    body = comment.body or ""
+    
+    # STEP 1: Fast-path mention detection
+    mentions = list(set(iter_mentions(body, alias_to_asset, ticker_to_asset, multi_alias_index, aliases_equal_ticker)))
+    if not mentions:
+        return  # No potential mentions found
+    
+    # STEP 2: LLM classification for each mention
+    kept: List[Tuple[int, str, str]] = []       # Mentions that passed LLM filter
+    sentiments: Dict[int, int] = {}             # asset_id -> sentiment score
+    sentiment_labels: Dict[int, str] = {}       # asset_id -> sentiment label
+    
+    for asset_id, sym, mention_text in mentions:
+        sent, sent_label = score_sentiment_llm(openai_client, model, body, sym, mention_text)
+        if sent is None:  # LLM returned "Not Stock"
+            info("llm_filtered", symbol=sym, mention=mention_text, decision=sent_label, preview=body[:100])
+            continue
+        kept.append((asset_id, sym, mention_text))
+        sentiments[asset_id] = sent
+        sentiment_labels[asset_id] = sent_label
+        
+    if not kept:
+        return  # All mentions filtered out by LLM
+    
+    # STEP 3: Prepare database insert data
+    created = datetime.fromtimestamp(float(comment.created_utc), tz=timezone.utc)
+    link = f"https://reddit.com{getattr(comment, 'permalink', '')}"
+    src_name = f"/r/{getattr(getattr(comment, 'subreddit', None), 'display_name', '').strip()}".lower()
+    source_id = source_name_to_id.get(src_name)
+    if not source_id:
+        err("unknown_source", src=src_name)
+        return
+    
+    # STEP 4: Insert to database (dedupe to one row per asset per comment)
+    inserted_asset_ids: List[int] = []
+    for asset_id in {aid for (aid, _, _) in kept}:  # Unique asset IDs only
+        sent = sentiments[asset_id]
+        insert_comment(conn, asset_id, source_id, created, sent, body, link)
+        inserted_asset_ids.append(asset_id)
+    
+    # STEP 5: Log successful inserts with sentiment decisions
+    tickers = sorted({ asset_id_to_ticker.get(aid, "") for aid in inserted_asset_ids if asset_id_to_ticker.get(aid) })
+    preview = body[:220] + ("..." if len(body) > 220 else "")
+    # Include LLM sentiment decisions in the log
+    decisions = {asset_id_to_ticker.get(aid, ""): sentiment_labels.get(aid, "") for aid in inserted_asset_ids if asset_id_to_ticker.get(aid)}
+    info("mention_inserted", n=len(inserted_asset_ids), tickers=tickers, decisions=decisions, src=src_name, link=link, preview=preview)
+
+
+def make_db_connection(db_url: str) -> Connection:
+    """Connect to the database, with autocommit enabled."""
+    conn = connect(db_url)
+    conn.autocommit = True
+    return conn
+
+
+def ensure_db_connection(conn: Connection | None, db_url: str) -> Connection:
+    """Ensure the database connection is alive, reconnecting if necessary."""
+    if conn is None or conn.closed:
+        info("db_reconnecting")
+        return make_db_connection(db_url)
+    try:
+        # A lightweight query to check if the connection is still valid
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    except Exception as e:
+        err("db_connection_lost", error=str(e))
+        info("db_reconnecting")
+        return make_db_connection(db_url)
+    return conn
+
+
 def main():
     """Entry point: stream comments, detect mentions, classify, and insert."""
     # Load configuration
@@ -373,82 +470,65 @@ def main():
 
     # Initialize Reddit client and test authentication
     reddit = make_reddit_client(s)
-    try:
-        reddit.user.me()  # Preflight auth check
-    except prawcore.exceptions.ResponseException as e:
-        err("reddit_auth_failed", status=getattr(e, 'response', None).status_code if hasattr(e, 'response') else None)
-        raise
 
     # Connect to database
     if not s.DATABASE_URL:
         raise RuntimeError("DATABASE_URL is required")
-    conn = connect(s.DATABASE_URL)
-    conn.autocommit = True
+    conn = make_db_connection(s.DATABASE_URL)
 
     # Build detection indices and source mappings
     alias_to_asset, ticker_to_asset, asset_id_to_ticker, multi_alias_index, aliases_equal_ticker = fetch_alias_map(conn)
     source_name_to_id = load_sources(conn)
+    last_alias_refresh = time.time()
+    ALIAS_REFRESH_INTERVAL = 3600  # 1 hour
 
     # Start streaming comments from all configured subreddits
     # Reddit API accepts multiple subreddits joined with '+'
     multi = "+".join(subreddits)
-    streams = [reddit.subreddit(multi).stream.comments(skip_existing=True)]
 
-    info("stream_start", subreddits=subreddits)
-    
     # Main processing loop
-    for comment in streams[0]:
+    while True:
         try:
-            body = comment.body or ""
-            
-            # STEP 1: Fast-path mention detection
-            mentions = list(set(iter_mentions(body, alias_to_asset, ticker_to_asset, multi_alias_index, aliases_equal_ticker)))
-            if not mentions:
-                continue  # No potential mentions found
-            
-            # STEP 2: LLM classification for each mention
-            kept: List[Tuple[int, str, str]] = []       # Mentions that passed LLM filter
-            sentiments: Dict[int, int] = {}             # asset_id -> sentiment score
-            sentiment_labels: Dict[int, str] = {}       # asset_id -> sentiment label
-            
-            for asset_id, sym, mention_text in mentions:
-                sent, sent_label = score_sentiment_llm(openai_client, model, body, sym, mention_text)
-                if sent is None:  # LLM returned "Not Stock"
-                    info("llm_filtered", symbol=sym, mention=mention_text, decision=sent_label, preview=body[:100])
-                    continue
-                kept.append((asset_id, sym, mention_text))
-                sentiments[asset_id] = sent
-                sentiment_labels[asset_id] = sent_label
-                
-            if not kept:
-                continue  # All mentions filtered out by LLM
-            
-            # STEP 3: Prepare database insert data
-            created = datetime.fromtimestamp(float(comment.created_utc), tz=timezone.utc)
-            link = f"https://reddit.com{getattr(comment, 'permalink', '')}"
-            src_name = f"/r/{getattr(getattr(comment, 'subreddit', None), 'display_name', '').strip()}".lower()
-            source_id = source_name_to_id.get(src_name)
-            if not source_id:
-                err("unknown_source", src=src_name)
-                continue
-            
-            # STEP 4: Insert to database (dedupe to one row per asset per comment)
-            inserted_asset_ids: List[int] = []
-            for asset_id in {aid for (aid, _, _) in kept}:  # Unique asset IDs only
-                sent = sentiments[asset_id]
-                insert_comment(conn, asset_id, source_id, created, sent, body, link)
-                inserted_asset_ids.append(asset_id)
-            
-            # STEP 5: Log successful inserts with sentiment decisions
-            tickers = sorted({ asset_id_to_ticker.get(aid, "") for aid in inserted_asset_ids if asset_id_to_ticker.get(aid) })
-            preview = body[:220] + ("..." if len(body) > 220 else "")
-            # Include LLM sentiment decisions in the log
-            decisions = {asset_id_to_ticker.get(aid, ""): sentiment_labels.get(aid, "") for aid in inserted_asset_ids if asset_id_to_ticker.get(aid)}
-            info("mention_inserted", n=len(inserted_asset_ids), tickers=tickers, decisions=decisions, src=src_name, link=link, preview=preview)
-            
+            # Periodically refresh asset aliases from DB
+            if time.time() - last_alias_refresh > ALIAS_REFRESH_INTERVAL:
+                info("alias_map_reloading")
+                conn = ensure_db_connection(conn, s.DATABASE_URL)
+                alias_to_asset, ticker_to_asset, asset_id_to_ticker, multi_alias_index, aliases_equal_ticker = fetch_alias_map(conn)
+                last_alias_refresh = time.time()
+                info("alias_map_reloaded")
+
+            info("stream_start", subreddits=subreddits)
+            stream = reddit.subreddit(multi).stream.comments(skip_existing=True)
+            for comment in stream:
+                try:
+                    # Ensure database is connected before processing
+                    conn = ensure_db_connection(conn, s.DATABASE_URL)
+                    process_comment(
+                        comment,
+                        conn,
+                        openai_client,
+                        model,
+                        alias_to_asset,
+                        ticker_to_asset,
+                        multi_alias_index,
+                        aliases_equal_ticker,
+                        source_name_to_id,
+                        asset_id_to_ticker,
+                    )
+                except Exception as e:
+                    # Error processing a single comment, log it and continue
+                    comment_id = getattr(comment, "id", None)
+                    err("process_comment_error", error=str(e), comment_id=comment_id)
+                    time.sleep(1)  # Brief pause on error before continuing
+
+        except prawcore.exceptions.PrawcoreException as e:
+            err("stream_error_prawcore", error=str(e))
+            info("stream_restarting_delay", delay=15)
+            time.sleep(15)  # Wait 15s before restarting stream on PRAW error
         except Exception as e:
-            err("process_error", error=str(e))
-            time.sleep(1)  # Brief pause on error before continuing
+            err("stream_loop_unhandled_error", error=str(e))
+            info("stream_restarting_delay", delay=60)
+            time.sleep(60)  # Longer wait for unknown errors before restarting
 
 
 if __name__ == "__main__":
