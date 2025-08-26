@@ -8,6 +8,13 @@ RUN pip install -r requirements.txt
 COPY --chown=app:app core /app/core
 COPY --chown=app:app services /app/services
 COPY --chown=app:app config /app/config
-# default command overridden by docker-compose
-CMD ["python","-m","services.reddit1.main"]
+COPY --chown=app:app ops/healthcheck.py /app/ops/healthcheck.py
+
+HEALTHCHECK --interval=5m --timeout=10s --start-period=1m --retries=3 \
+  CMD ["python", "/app/ops/healthcheck.py"]
+
+# default command overridden by docker-compose. 
+# To run the new worker, you would use:
+# CMD ["python", "-m", "services.signals_worker.main"]
+CMD ["python", "-m", "services.reddit1.main"]
 

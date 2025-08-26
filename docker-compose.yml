@@ -59,3 +59,12 @@ services:
       timeout: 5s
       retries: 3
 
+  signals_worker:
+    build: .
+    container_name: signals_worker
+    restart: always
+    env_file: anthill.env
+    environment:
+      SERVICE_NAME: signals_worker
+    command: ["python", "-m", "services.signals_worker.main"]
+
