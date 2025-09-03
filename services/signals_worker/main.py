@@ -4,6 +4,19 @@ import logging
 from datetime import datetime, timezone, timedelta
 import random
 from contextlib import contextmanager
+from zoneinfo import ZoneInfo
+import requests
+import math
+try:
+    # Prefer precise NYSE holiday calendar if available
+    from holidays.financial import NYSE as _HolidayProvider  # type: ignore
+    _HOLIDAY_PROVIDER = _HolidayProvider()
+except Exception:
+    try:
+        import holidays as _holidays_mod  # type: ignore
+        _HOLIDAY_PROVIDER = _holidays_mod.UnitedStates()
+    except Exception:
+        _HOLIDAY_PROVIDER = None
 
 import psycopg
 from psycopg.rows import dict_row
@@ -90,6 +103,221 @@ def update_heartbeat(conn, job_name: str, status: str, error_message: str | None
                 ON CONFLICT (job_name) DO UPDATE SET last_err = %s;
             """, (job_name, error_message, error_message))
     logging.info(f"Heartbeat updated for {job_name} with status: {status}")
+
+def is_us_market_holiday(now_utc: datetime) -> bool:
+    """Returns True if today is a US stock market holiday (best-effort).
+
+    Uses NYSE calendar when available, otherwise falls back to US federal holidays.
+    """
+    if _HOLIDAY_PROVIDER is None:
+        return False
+    try:
+        now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+        d = now_et.date()
+        return d in _HOLIDAY_PROVIDER
+    except Exception:
+        return False
+
+def is_us_equity_market_hours(now_utc: datetime) -> bool:
+    """Approximate US equity regular hours: 09:30–16:00 ET on weekdays (no holiday calendar)."""
+    try:
+        now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        logging.info("Market-hours check: timezone conversion failed; treating as closed")
+        return False
+    if now_et.weekday() >= 5:
+        logging.info(f"Market-hours check: weekend (weekday={now_et.weekday()}) -> closed")
+        return False
+    if is_us_market_holiday(now_utc):
+        logging.info("Market-hours check: holiday -> closed")
+        return False
+    start = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    end = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    is_open = start <= now_et <= end
+    logging.info(f"Market-hours check: now_et={now_et.isoformat()} in regular hours -> {is_open}")
+    return is_open
+
+def fetch_tiingo_intraday_snapshot(ticker: str, token: str) -> dict | None:
+    """Fetches intraday snapshot from Tiingo IEX endpoint for a single ticker.
+
+    Returns a dict with keys 'last' and 'prevClose' if available.
+    """
+    url = "https://api.tiingo.com/iex"
+    params = {"tickers": ticker, "token": token}
+    try:
+        logging.info(f"Tiingo intraday request for {ticker}")
+        resp = requests.get(url, params=params, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            row = data[0]
+            result = {
+                "last": row.get("last"),
+                "prevClose": row.get("prevClose"),
+                "yearHigh": row.get("yearHigh"),
+                "yearLow": row.get("yearLow"),
+            }
+            logging.info(f"Tiingo intraday snapshot {ticker}: last={result['last']} prevClose={result['prevClose']} yearHigh={result['yearHigh']} yearLow={result['yearLow']}")
+            return result
+    except Exception as e:
+        logging.warning(f"Tiingo intraday snapshot failed for {ticker}: {e}")
+    return None
+
+def fetch_tiingo_eod_prices(ticker: str, start_date: str, end_date: str, token: str) -> list[dict]:
+    """Fetch Tiingo EOD daily prices for [start_date, end_date]. Returns list of bars sorted by date."""
+    url = f"https://api.tiingo.com/tiingo/daily/{ticker}/prices"
+    params = {"startDate": start_date, "endDate": end_date, "token": token}
+    try:
+        logging.info(f"Tiingo EOD request for {ticker}: {start_date} -> {end_date}")
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            logging.info(f"Tiingo EOD received {len(data)} bars for {ticker}")
+            return data
+    except Exception as e:
+        logging.warning(f"Tiingo EOD fetch failed for {ticker}: {e}")
+    return []
+
+def compute_pct_change_1d_equity(ticker: str, now_utc: datetime, token: str) -> float | None:
+    """Computes 1-day % change for equities using intraday when appropriate else EOD closes.
+
+    Rules:
+    - If market hours and intraday delta indicates a real move, use (last - prevClose)/prevClose*100
+    - Otherwise, compute using last two adjusted EOD closes
+    Returns a rounded float (2 decimals) or None if unavailable.
+    """
+    try:
+        if is_us_equity_market_hours(now_utc):
+            snap = fetch_tiingo_intraday_snapshot(ticker, token)
+            if snap and snap.get("last") is not None and snap.get("prevClose") not in (None, 0):
+                last = float(snap["last"])  # most recent trade price
+                prev_close = float(snap["prevClose"])  # previous trading day's close
+                # "real move" check: ignore if essentially unchanged
+                delta = last - prev_close
+                logging.info(f"1d calc (intraday) {ticker}: last={last} prevClose={prev_close} delta={delta}")
+                if abs(delta) >= max(0.01, 0.0005 * prev_close):
+                    pct = (last - prev_close) / prev_close * 100.0
+                    logging.info(f"1d calc (intraday) {ticker}: pct={pct}")
+                    return round(pct, 2)
+
+        # Fallback to EOD closes (also used outside market hours)
+        end_dt = now_utc.date()
+        start_dt = end_dt - timedelta(days=10)
+        bars = fetch_tiingo_eod_prices(ticker, start_dt.isoformat(), end_dt.isoformat(), token)
+        # Use adjusted closes from the last two trading days
+        closes = [b.get("adjClose") for b in bars if b.get("adjClose") is not None]
+        if len(closes) >= 2:
+            prev, last = closes[-2], closes[-1]
+            if prev not in (None, 0):
+                pct = (last - prev) / prev * 100.0
+                logging.info(f"1d calc (EOD) {ticker}: prev={prev} last={last} pct={pct}")
+                return round(pct, 2)
+    except Exception as e:
+        logging.warning(f"Failed 1d change calc for {ticker}: {e}")
+    return None
+
+def compute_pct_change_7d_equity(ticker: str, now_utc: datetime, token: str) -> float | None:
+    """Computes 7-day % change using adjusted EOD closes, choosing the closest earlier trading day ~7 days prior.
+
+    Returns a rounded float (2 decimals) or None if unavailable.
+    """
+    try:
+        end_dt = now_utc.date()
+        start_dt = end_dt - timedelta(days=14)
+        target_dt = end_dt - timedelta(days=7)
+        bars = fetch_tiingo_eod_prices(ticker, start_dt.isoformat(), end_dt.isoformat(), token)
+        if not bars:
+            return None
+        # Ensure sorted by date ascending
+        try:
+            bars.sort(key=lambda b: b.get("date", ""))
+        except Exception:
+            pass
+        # Map date->adjClose
+        eod = []
+        for b in bars:
+            adj = b.get("adjClose")
+            d = b.get("date")
+            if adj is None or d is None:
+                continue
+            # Tiingo dates like 2024-08-09T00:00:00.000Z -> take date part
+            d_str = d[:10]
+            eod.append((d_str, float(adj)))
+        if not eod:
+            return None
+        # latest close
+        last_date, last_close = eod[-1]
+        # find closest earlier trading day to target_dt
+        target_str = target_dt.isoformat()
+        candidate = None
+        for d_str, c in reversed(eod):
+            if d_str <= target_str:
+                candidate = (d_str, c)
+                break
+        if candidate is None:
+            # no earlier trading day; take earliest available
+            candidate = eod[0]
+        prev_date, prev_close = candidate
+        if prev_close in (None, 0):
+            return None
+        pct = (last_close - prev_close) / prev_close * 100.0
+        logging.info(f"7d calc {ticker}: last=({last_date},{last_close}) prev=({prev_date},{prev_close}) pct={pct}")
+        return round(pct, 2)
+    except Exception as e:
+        logging.warning(f"Failed 7d change calc for {ticker}: {e}")
+    return None
+
+def get_current_price_equity(ticker: str, now_utc: datetime, token: str) -> float | None:
+    """Gets the current price: use intraday last when available, otherwise last EOD adjClose."""
+    try:
+        snap = fetch_tiingo_intraday_snapshot(ticker, token)
+        if snap and snap.get("last") is not None:
+            price = float(snap["last"])
+            logging.info(f"Current price (intraday) {ticker}: {price}")
+            return round(price, 2)
+        end_dt = now_utc.date()
+        start_dt = end_dt - timedelta(days=10)
+        bars = fetch_tiingo_eod_prices(ticker, start_dt.isoformat(), end_dt.isoformat(), token)
+        closes = [b.get("adjClose") for b in bars if b.get("adjClose") is not None]
+        if closes:
+            price = float(closes[-1])
+            logging.info(f"Current price (EOD) {ticker}: {price}")
+            return round(price, 2)
+    except Exception as e:
+        logging.warning(f"Failed current price for {ticker}: {e}")
+    return None
+
+def fetch_52wk_high_low_equity(ticker: str, now_utc: datetime, token: str) -> tuple[float | None, float | None]:
+    """Returns (yearHigh, yearLow) if available; falls back to computing from ~370 days EOD adjClose."""
+    try:
+        snap = fetch_tiingo_intraday_snapshot(ticker, token)
+        yh = snap.get("yearHigh") if snap else None
+        yl = snap.get("yearLow") if snap else None
+        if yh is not None and yl is not None:
+            try:
+                yh_f = round(float(yh), 2)
+                yl_f = round(float(yl), 2)
+                logging.info(f"52w from snapshot {ticker}: high={yh_f} low={yl_f}")
+                return yh_f, yl_f
+            except Exception:
+                pass
+    except Exception as e:
+        logging.info(f"Snapshot lacked 52w range for {ticker}: {e}")
+
+    try:
+        end_dt = now_utc.date()
+        start_dt = end_dt - timedelta(days=370)
+        bars = fetch_tiingo_eod_prices(ticker, start_dt.isoformat(), end_dt.isoformat(), token)
+        closes = [float(b.get("adjClose")) for b in bars if b.get("adjClose") is not None]
+        if closes:
+            yh_f = round(max(closes), 2)
+            yl_f = round(min(closes), 2)
+            logging.info(f"52w from EOD {ticker}: high={yh_f} low={yl_f}")
+            return yh_f, yl_f
+    except Exception as e:
+        logging.warning(f"Failed 52w calc for {ticker}: {e}")
+    return None, None
 
 def calculate_signals(conn, as_of: datetime, baseline_lookback_windows: int):
     """
@@ -231,7 +459,11 @@ def generate_summary(client: OpenAI, model: str, comments: list[str], ticker: st
 
     prompt = f"""
         The following are recent comments from social media about the stock ${ticker}.
-        Please provide a brief, neutral summary of the key themes, overall sentiment, and what might be driving the mention spike.
+        Please provide a neutral summary that highlights:
+        - Key themes and overall sentiment
+        - Potential catalysts for the mention spike, with special attention to any NEWS items or headlines referenced
+        - Notable disagreements or uncertainty if present
+        Keep the response concise but longer if needed to capture material details.
 
         Comments:
         ---
@@ -244,7 +476,7 @@ def generate_summary(client: OpenAI, model: str, comments: list[str], ticker: st
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=200,
+            max_tokens=350,
         )
         summary = response.choices[0].message.content
         return summary.strip() if summary else "Could not generate a summary."
@@ -259,7 +491,7 @@ def process_alerts(conn, signal_rows, config, openai_client):
     if not signal_rows:
         return
 
-    MAX_ALERTS_PER_RUN = 5  # Temporary cap for testing
+    MAX_ALERTS_PER_RUN = 5  # Temporary cap to prevent email floods
     alerts_sent_this_run = 0
 
     asset_ids = [row['asset_id'] for row in signal_rows]
@@ -308,6 +540,22 @@ def process_alerts(conn, signal_rows, config, openai_client):
             
             asset_url = f"{config['frontend_base_url']}/dashboard/symbol/{ticker}?universe={asset.get('universe', 'stock')}"
 
+            # Price performance (equities)
+            pct_change_1d = None
+            pct_change_7d = None
+            current_price = None
+            year_high = None
+            year_low = None
+            try:
+                if asset.get('universe', 'stock') == 'stock' and config.get('tiingo_api_key'):
+                    pct_change_1d = compute_pct_change_1d_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
+                    pct_change_7d = compute_pct_change_7d_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
+                    current_price = get_current_price_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
+                    yh, yl = fetch_52wk_high_low_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
+                    year_high, year_low = yh, yl
+            except Exception as e:
+                logging.warning(f"Price change computation failed for {ticker}: {e}")
+
             body = f"""
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #ddd; border-radius: 8px; padding: 20px;">
                 <h2 style="color: #1a1a1a; border-bottom: 2px solid #eee; padding-bottom: 10px;">Mention Spike Alert: ${ticker}</h2>
@@ -326,6 +574,15 @@ def process_alerts(conn, signal_rows, config, openai_client):
                     <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">Share of Voice</td><td style="padding: 8px; text-align: right;">{float(row['sov_now']) * 100:.2f}%</td></tr>
                     <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">Baseline Mean SoV</td><td style="padding: 8px; text-align: right;">{float(row['mu_sov']) * 100:.2f}%</td></tr>
                     <tr><td style="padding: 8px;">Baseline Std Dev</td><td style="padding: 8px; text-align: right;">{float(row['sigma_sov']) * 100:.2f}%</td></tr>
+                </table>
+
+                <h4 style="color: #333; margin-top: 20px;">Price Performance</h4>
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">Current Price</td><td style="padding: 8px; text-align: right;">{(f"${current_price:.2f}" if current_price is not None else "N/A")}</td></tr>
+                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">1d Change</td><td style="padding: 8px; text-align: right;">{(f"{pct_change_1d:.2f}%" if pct_change_1d is not None else "N/A")}</td></tr>
+                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">7d Change</td><td style="padding: 8px; text-align: right;">{(f"{pct_change_7d:.2f}%" if pct_change_7d is not None else "N/A")}</td></tr>
+                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">52-Week High</td><td style="padding: 8px; text-align: right;">{(f"${year_high:.2f}" if year_high is not None else "N/A")}</td></tr>
+                    <tr><td style="padding: 8px;">52-Week Low</td><td style="padding: 8px; text-align: right;">{(f"${year_low:.2f}" if year_low is not None else "N/A")}</td></tr>
                 </table>
 
                 <div style="text-align: center; margin-top: 25px;">
@@ -383,6 +640,7 @@ def main():
             "alert_cooldown_hours": int(get_env_var("ALERT_COOLDOWN_HOURS", "6")),
             "baseline_min_windows": int(get_env_var("BASELINE_MIN_WINDOWS", "12")),
             "baseline_lookback_windows": int(get_env_var("BASELINE_LOOKBACK_WINDOWS", "48")),
+            "tiingo_api_key": os.getenv("TIINGO_API_KEY"),
         }
     except (ValueError, TypeError) as e:
         logging.error(f"Configuration error: {e}")
@@ -400,15 +658,11 @@ def main():
 
     while True:
         now_utc = datetime.now(timezone.utc)
-        
         # Align to the top of the next hour
         next_hour = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        
         sleep_seconds = (next_hour - now_utc).total_seconds() + random.uniform(-1, 1) # Add jitter
-        
         logging.info(f"Next run at {next_hour.isoformat()}. Sleeping for {sleep_seconds:.2f} seconds.")
         time.sleep(sleep_seconds)
-
         as_of = next_hour
         logging.info(f"Worker tick. Processing for as_of={as_of.isoformat()}")
 
@@ -439,6 +693,8 @@ def main():
                     update_heartbeat(conn, "sov_signals_2h", "error", str(e))
             except Exception as he:
                 logging.error(f"Failed to write error heartbeat: {he}", exc_info=True)
+
+        # continue loop normally
 
 if __name__ == "__main__":
     main()

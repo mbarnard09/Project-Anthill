@@ -37,5 +37,3 @@ docker-compose logs -f reddit1
 docker-compose logs -f stocktwits
 ```
 
-## That's it!
-Your scrapers should be running. The `docker-compose ps` command shows if all containers are up and running.

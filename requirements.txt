@@ -13,3 +13,5 @@ psycopg[binary]
 sendgrid
 openai
 
+requests>=2.31.0
+holidays>=0.49

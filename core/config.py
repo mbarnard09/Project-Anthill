@@ -21,9 +21,9 @@ class Settings(BaseSettings):
     SUBREDDITS_CONFIG_PATH: str = os.getenv("SUBREDDITS_CONFIG_PATH", "config/reddit1.subreddits.yml")
 
     # OpenAI
-    OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY", "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")
-    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY", "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")
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 
     class Config:
-        env_file = ".env"
+        env_file = "anthill.env"
 

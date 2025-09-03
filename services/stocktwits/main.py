@@ -118,22 +118,22 @@ class StockTwitsScraper:
             if len(cleaned_text.strip()) < 3:
                 return 0  # Neutral for very short messages
             
-            # Create the prompt similar to Reddit scraper
-            system_prompt = """You are analyzing sentiment in StockTwits messages about stocks. Respond with exactly one word:
-
-"Bullish" - if the message expresses positive sentiment about the stock's future price/performance
-"Bearish" - if the message expresses negative sentiment about the stock's future price/performance  
-"Neutral" - if unclear, mixed sentiment, or not about the stock's investment prospects"""
+            # Minimal sentiment classification prompt
+            system_prompt = """Classify sentiment for the stock mentioned in the comment.
+Return exactly one word:
+Bullish (positive, buy, up)
+Bearish (negative, sell, down)
+Neutral (unclear, mixed)"""
 
             user_prompt = f"SYMBOL: {symbol}\nMESSAGE: {cleaned_text[:500]}"  # Limit length
-            
+
             response = await self.openai_client.chat.completions.create(
                 model=self.settings.OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                max_tokens=10,
+                max_tokens=4,
                 temperature=0
             )
             

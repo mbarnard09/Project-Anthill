@@ -31,4 +31,3 @@ docker compose logs -f reddit1
 ## Dev tips
 - Edit any service file and rebuild: docker compose up -d --build <service>
 - Stop everything: docker compose down
-
