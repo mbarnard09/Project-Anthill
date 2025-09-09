@@ -51,7 +51,6 @@ services:
     env_file: anthill.env
     environment:
       SERVICE_NAME: fourchan
-      FOURCHAN_BOARDS: ${FOURCHAN_BOARDS}
     command: ["python","-m","services.fourchan.main"]
     healthcheck:
       test: ["CMD","python","-c","import sys; sys.exit(0)"]

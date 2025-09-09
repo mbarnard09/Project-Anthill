@@ -5,9 +5,14 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     DATABASE_URL: str = os.getenv("DATABASE_URL", os.getenv("POSTGRES_URL", ""))
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    POLL_SECONDS: int = int(os.getenv("POLL_SECONDS", "20"))
+    POLL_SECONDS: int = int(os.getenv("POLL_SECONDS", "10"))
     SUBREDDITS: str | None = os.getenv("SUBREDDITS")
     FOURCHAN_BOARDS: str = os.getenv("FOURCHAN_BOARDS", "biz")
+    FOURCHAN_MAX_AGE_MINUTES: int = int(os.getenv("FOURCHAN_MAX_AGE_MINUTES", "30"))
+    FOURCHAN_EXCLUDE_TICKERS: str = os.getenv(
+        "FOURCHAN_EXCLUDE_TICKERS",
+        "BTC,ETH,SOL,ADA,XRP,DOGE,AVAX,BNB,TRX,DOT,MATIC,LTC,BCH,SHIB,LINK,ATOM,XMR,XLM,NEAR,APT,SUI,ARB,OP,PEPE,TON,FIL,ICP,ETC,AAVE,UNI",
+    )
     SERVICE_NAME: str = os.getenv("SERVICE_NAME", "service")
 
     # Reddit API (script-type app)
@@ -21,7 +26,7 @@ class Settings(BaseSettings):
     SUBREDDITS_CONFIG_PATH: str = os.getenv("SUBREDDITS_CONFIG_PATH", "config/reddit1.subreddits.yml")
 
     # OpenAI
-    OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY", "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")
+    OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY", "")
     OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 
     class Config:
