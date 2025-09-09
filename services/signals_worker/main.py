@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from zoneinfo import ZoneInfo
 import requests
 import math
+from requests_oauthlib import OAuth1
 try:
     # Prefer precise NYSE holiday calendar if available
     from holidays.financial import NYSE as _HolidayProvider  # type: ignore
@@ -484,6 +485,125 @@ def generate_summary(client: OpenAI, model: str, comments: list[str], ticker: st
         logging.error(f"Failed to generate summary for ${ticker}: {e}", exc_info=True)
         return "Summary generation failed due to an error."
 
+def _safe_percent_str(value: float | None) -> str:
+    try:
+        if value is None:
+            return "N/A"
+        return f"{value:.2f}%"
+    except Exception:
+        return "N/A"
+
+def _safe_money_str(value: float | None) -> str:
+    try:
+        if value is None:
+            return "N/A"
+        return f"${value:.2f}"
+    except Exception:
+        return "N/A"
+
+def build_tweet_text_full(ticker: str,
+                          company_name: str,
+                          summary: str,
+                          current_price: float | None,
+                          pct_change_1d: float | None,
+                          pct_change_7d: float | None,
+                          year_high: float | None,
+                          year_low: float | None) -> str:
+    """Builds a full-length tweet (no 280-char truncation)."""
+    header = f"Mention Spike Alert: ${ticker}"
+    intro = f"A significant increase in social media mentions has been detected for {company_name}."
+    price_bits: list[str] = []
+    price_bits.append(f"Price: {_safe_money_str(current_price)}")
+    price_bits.append(f"1d: {_safe_percent_str(pct_change_1d)}")
+    price_bits.append(f"7d: {_safe_percent_str(pct_change_7d)}")
+    if year_high is not None and year_low is not None:
+        price_bits.append(f"52w: {_safe_money_str(year_high)}/{_safe_money_str(year_low)}")
+    price_line = " | ".join(price_bits)
+    summary_prefix = "ChatGPT Summary of comments: "
+    clean_summary = (summary or "").strip()
+    return f"{header}\n\n{intro}\n\n{price_line}\n\n{summary_prefix}{clean_summary}"
+
+def build_tweet_text(ticker: str,
+                     company_name: str,
+                     summary: str,
+                     current_price: float | None,
+                     pct_change_1d: float | None,
+                     pct_change_7d: float | None,
+                     year_high: float | None,
+                     year_low: float | None) -> str:
+    """Builds a tweet within 280 characters based on the email alert content."""
+    header = f"Mention Spike Alert: ${ticker}"
+    intro = f"A significant increase in social media mentions has been detected for {company_name}."
+
+    price_bits = []
+    price_bits.append(f"Price: {_safe_money_str(current_price)}")
+    price_bits.append(f"1d: {_safe_percent_str(pct_change_1d)}")
+    price_bits.append(f"7d: {_safe_percent_str(pct_change_7d)}")
+    if year_high is not None and year_low is not None:
+        price_bits.append(f"52w: {_safe_money_str(year_high)}/{_safe_money_str(year_low)}")
+    price_line = " | ".join(price_bits)
+
+    # Base without summary
+    base = f"{header}\n\n{intro}\n\n{price_line}\n\n"
+    summary_prefix = "ChatGPT Summary of comments: "
+
+    # compute available chars for summary
+    max_len = 280
+    available = max_len - len(base) - len(summary_prefix)
+    clean_summary = summary.replace("\n", " ").strip()
+
+    if available <= 0:
+        # try to condense price_line by removing 52w then 7d if needed
+        condensed_bits = [f"Price: {_safe_money_str(current_price)}", f"1d: {_safe_percent_str(pct_change_1d)}"]
+        condensed = " | ".join(condensed_bits)
+        base = f"{header}\n\n{intro}\n\n{condensed}\n\n"
+        available = max_len - len(base) - len(summary_prefix)
+
+    # final fallback: ensure at least some space for summary
+    if available < 20:
+        # minimal format
+        base = f"{header}\n{intro}\n"
+        available = max_len - len(base) - len(summary_prefix)
+
+    if available <= 0:
+        available = 0
+
+    if len(clean_summary) > available:
+        if available <= 1:
+            clean_summary = "…"
+        else:
+            clean_summary = clean_summary[:available - 1].rstrip() + "…"
+
+    tweet = f"{base}{summary_prefix}{clean_summary}"
+    # Safety clamp
+    if len(tweet) > 280:
+        tweet = tweet[:279] + "…"
+    return tweet
+
+def post_tweet(text: str, config: dict) -> bool:
+    """Posts a tweet using Twitter API v2 and OAuth 1.0a credentials."""
+    try:
+        ck = config.get('twitter_consumer_key')
+        cs = config.get('twitter_consumer_secret')
+        at = config.get('twitter_access_token')
+        ats = config.get('twitter_access_secret')
+        if not all([ck, cs, at, ats]):
+            logging.warning("Twitter posting skipped: missing credentials.")
+            return False
+
+        url = "https://api.twitter.com/2/tweets"
+        auth = OAuth1(ck, cs, at, ats)
+        payload = {"text": text}
+        resp = requests.post(url, json=payload, auth=auth, timeout=10)
+        if 200 <= resp.status_code < 300:
+            logging.info("Tweet posted successfully.")
+            return True
+        logging.error(f"Failed to post tweet. Status={resp.status_code} Body={resp.text}")
+        return False
+    except Exception as e:
+        logging.error(f"Error while posting tweet: {e}", exc_info=True)
+        return False
+
 def process_alerts(conn, signal_rows, config, openai_client):
     """
     Processes signals to generate alerts based on thresholds and cooldowns.
@@ -607,6 +727,37 @@ def process_alerts(conn, signal_rows, config, openai_client):
                 logging.error(f"Failed to send email for asset {row['asset_id']}: {e}", exc_info=True)
                 continue # Do not record if email failed
 
+            # 3b. Optional: Tweet the alert
+            try:
+                if config.get('twitter_enabled'):
+                    full_tweet = build_tweet_text_full(
+                        ticker=ticker,
+                        company_name=f"{asset.get('name', ticker)} (${ticker})",
+                        summary=summary,
+                        current_price=current_price,
+                        pct_change_1d=pct_change_1d,
+                        pct_change_7d=pct_change_7d,
+                        year_high=year_high,
+                        year_low=year_low
+                    )
+                    posted = post_tweet(full_tweet, config)
+                    if not posted:
+                        # Fallback to truncated variant
+                        logging.warning(f"Full-length tweet failed, attempting truncated tweet for {ticker}.")
+                        short_tweet = build_tweet_text(
+                            ticker=ticker,
+                            company_name=f"{asset.get('name', ticker)} (${ticker})",
+                            summary=summary,
+                            current_price=current_price,
+                            pct_change_1d=pct_change_1d,
+                            pct_change_7d=pct_change_7d,
+                            year_high=year_high,
+                            year_low=year_low
+                        )
+                        post_tweet(short_tweet, config)
+            except Exception as e:
+                logging.error(f"Failed tweeting alert for {ticker}: {e}", exc_info=True)
+
             # 4. Record the alert
             with conn.cursor() as cur:
                 cur.execute("""
@@ -641,6 +792,12 @@ def main():
             "baseline_min_windows": int(get_env_var("BASELINE_MIN_WINDOWS", "12")),
             "baseline_lookback_windows": int(get_env_var("BASELINE_LOOKBACK_WINDOWS", "48")),
             "tiingo_api_key": os.getenv("TIINGO_API_KEY"),
+            # Twitter
+            "twitter_enabled": get_env_var("TWITTER_ENABLED", "false").lower() in ("1", "true", "yes"),
+            "twitter_consumer_key": os.getenv("TWITTER_CONSUMER_KEY"),
+            "twitter_consumer_secret": os.getenv("TWITTER_CONSUMER_SECRET"),
+            "twitter_access_token": os.getenv("TWITTER_ACCESS_TOKEN"),
+            "twitter_access_secret": os.getenv("TWITTER_ACCESS_SECRET"),
         }
     except (ValueError, TypeError) as e:
         logging.error(f"Configuration error: {e}")
