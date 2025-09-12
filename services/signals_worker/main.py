@@ -329,12 +329,14 @@ def calculate_signals(conn, as_of: datetime, baseline_lookback_windows: int):
     logging.info(f"Calculating signals for window: [{window_start.isoformat()}, {as_of.isoformat()})")
 
     with conn.cursor() as cur:
-        # 1. Get comment counts per asset in the window.
+        # 1. Get comment counts per asset in the window (stock universe only).
         cur.execute("""
-            SELECT asset_id, COUNT(*) AS x_asset_2h
-            FROM comments
-            WHERE commented_at >= %s AND commented_at < %s
-            GROUP BY asset_id;
+            SELECT c.asset_id, COUNT(*) AS x_asset_2h
+            FROM comments c
+            JOIN assets a ON a.id = c.asset_id
+            WHERE c.commented_at >= %s AND c.commented_at < %s
+              AND a.universe = 'stock'
+            GROUP BY c.asset_id;
         """, (window_start, as_of))
         asset_counts = cur.fetchall()
         logging.info(f"Found mentions for {len(asset_counts)} assets in the window.")
@@ -501,6 +503,15 @@ def _safe_money_str(value: float | None) -> str:
     except Exception:
         return "N/A"
 
+def _safe_percent_signed(value: float | None) -> str:
+    try:
+        if value is None:
+            return "N/A"
+        sign = "+" if value > 0 else ""
+        return f"{sign}{value:.2f}%"
+    except Exception:
+        return "N/A"
+
 def build_tweet_text_full(ticker: str,
                           company_name: str,
                           summary: str,
@@ -510,18 +521,25 @@ def build_tweet_text_full(ticker: str,
                           year_high: float | None,
                           year_low: float | None) -> str:
     """Builds a full-length tweet (no 280-char truncation)."""
-    header = f"Mention Spike Alert: ${ticker}"
-    intro = f"A significant increase in social media mentions has been detected for {company_name}."
-    price_bits: list[str] = []
-    price_bits.append(f"Price: {_safe_money_str(current_price)}")
-    price_bits.append(f"1d: {_safe_percent_str(pct_change_1d)}")
-    price_bits.append(f"7d: {_safe_percent_str(pct_change_7d)}")
+    header = f"🚨 Mention Spike Alert: ${ticker}"
+    subheader = "We monitor Reddit, 4Chan, StockTwits and Twitter for unusual surges in mentions and sentiment using GPT5."
+    current_price_line = f"Current Price: {_safe_money_str(current_price)}"
+    daily_change_line = f"Daily Change: {_safe_percent_signed(pct_change_1d)}"
     if year_high is not None and year_low is not None:
-        price_bits.append(f"52w: {_safe_money_str(year_high)}/{_safe_money_str(year_low)}")
-    price_line = " | ".join(price_bits)
-    summary_prefix = "ChatGPT Summary of comments: "
+        wk52_line = f"52 Week H/L: {_safe_money_str(year_high)} - {_safe_money_str(year_low)}"
+    else:
+        wk52_line = "52 Week H/L: N/A"
+    summary_header = "AI Summary Of Mentions:"
     clean_summary = (summary or "").strip()
-    return f"{header}\n\n{intro}\n\n{price_line}\n\n{summary_prefix}{clean_summary}"
+    return (
+        f"{header}\n\n"
+        f"{subheader}\n\n"
+        f"{current_price_line}\n"
+        f"{daily_change_line}\n"
+        f"{wk52_line}\n\n"
+        f"{summary_header}\n"
+        f"{clean_summary}"
+    )
 
 def build_tweet_text(ticker: str,
                      company_name: str,
@@ -532,38 +550,42 @@ def build_tweet_text(ticker: str,
                      year_high: float | None,
                      year_low: float | None) -> str:
     """Builds a tweet within 280 characters based on the email alert content."""
-    header = f"Mention Spike Alert: ${ticker}"
-    intro = f"A significant increase in social media mentions has been detected for {company_name}."
-
-    price_bits = []
-    price_bits.append(f"Price: {_safe_money_str(current_price)}")
-    price_bits.append(f"1d: {_safe_percent_str(pct_change_1d)}")
-    price_bits.append(f"7d: {_safe_percent_str(pct_change_7d)}")
+    header = f"🚨 Mention Spike Alert: ${ticker}"
+    subheader = "We monitor Reddit, 4Chan, StockTwits and Twitter for unusual surges in mentions and sentiment using GPT5."
+    current_price_line = f"Current Price: {_safe_money_str(current_price)}"
+    daily_change_line = f"Daily Change: {_safe_percent_signed(pct_change_1d)}"
     if year_high is not None and year_low is not None:
-        price_bits.append(f"52w: {_safe_money_str(year_high)}/{_safe_money_str(year_low)}")
-    price_line = " | ".join(price_bits)
+        wk52_line = f"52 Week H/L: {_safe_money_str(year_high)} - {_safe_money_str(year_low)}"
+    else:
+        wk52_line = "52 Week H/L: N/A"
 
     # Base without summary
-    base = f"{header}\n\n{intro}\n\n{price_line}\n\n"
-    summary_prefix = "ChatGPT Summary of comments: "
+    base = (
+        f"{header}\n\n"
+        f"{subheader}\n\n"
+        f"{current_price_line}\n"
+        f"{daily_change_line}\n"
+        f"{wk52_line}\n\n"
+        f"AI Summary Of Mentions:\n"
+    )
 
     # compute available chars for summary
     max_len = 280
-    available = max_len - len(base) - len(summary_prefix)
+    available = max_len - len(base)
     clean_summary = summary.replace("\n", " ").strip()
 
     if available <= 0:
         # try to condense price_line by removing 52w then 7d if needed
-        condensed_bits = [f"Price: {_safe_money_str(current_price)}", f"1d: {_safe_percent_str(pct_change_1d)}"]
-        condensed = " | ".join(condensed_bits)
-        base = f"{header}\n\n{intro}\n\n{condensed}\n\n"
-        available = max_len - len(base) - len(summary_prefix)
+        base = (
+            f"{header}\n{current_price_line}\n{daily_change_line}\n\nAI Summary Of Mentions:\n"
+        )
+        available = max_len - len(base)
 
     # final fallback: ensure at least some space for summary
     if available < 20:
         # minimal format
-        base = f"{header}\n{intro}\n"
-        available = max_len - len(base) - len(summary_prefix)
+        base = f"{header}\nAI Summary Of Mentions:\n"
+        available = max_len - len(base)
 
     if available <= 0:
         available = 0
@@ -574,7 +596,7 @@ def build_tweet_text(ticker: str,
         else:
             clean_summary = clean_summary[:available - 1].rstrip() + "…"
 
-    tweet = f"{base}{summary_prefix}{clean_summary}"
+    tweet = f"{base}{clean_summary}"
     # Safety clamp
     if len(tweet) > 280:
         tweet = tweet[:279] + "…"

@@ -37,34 +37,37 @@ def build_tweet_text(ticker,
                      pct_change_7d,
                      year_high,
                      year_low):
-    """Builds a tweet within 280 characters mirroring the alert format."""
-    header = f"Mention Spike Alert: ${ticker}"
-    intro = f"A significant increase in social media mentions has been detected for {company_name}."
+    """Builds a tweet within 280 characters mirroring the prod format."""
+    header = f"🚨 Mention Spike Alert: ${ticker}"
+    subheader = "We monitor Reddit, 4Chan, StockTwits and Twitter for unusual surges in mentions and sentiment using GPT5."
 
-    price_bits = []
-    price_bits.append(f"Price: {_safe_money_str(current_price)}")
-    price_bits.append(f"1d: {_safe_percent_str(pct_change_1d)}")
-    price_bits.append(f"7d: {_safe_percent_str(pct_change_7d)}")
+    current_price_line = f"Current Price: {_safe_money_str(current_price)}"
+    daily_change_line = f"Daily Change: {(_safe_percent_str(pct_change_1d) if pct_change_1d is not None else 'N/A')}"
     if year_high is not None and year_low is not None:
-        price_bits.append(f"52w: {_safe_money_str(year_high)}/{_safe_money_str(year_low)}")
-    price_line = " | ".join(price_bits)
+        wk52_line = f"52 Week H/L: {_safe_money_str(year_high)} - {_safe_money_str(year_low)}"
+    else:
+        wk52_line = "52 Week H/L: N/A"
 
-    base = f"{header}\n\n{intro}\n\n{price_line}\n\n"
-    summary_prefix = "ChatGPT Summary of comments: "
+    base = (
+        f"{header}\n\n"
+        f"{subheader}\n\n"
+        f"{current_price_line}\n"
+        f"{daily_change_line}\n"
+        f"{wk52_line}\n\n"
+        f"AI Summary Of Mentions:\n"
+    )
 
     max_len = 280
-    available = max_len - len(base) - len(summary_prefix)
+    available = max_len - len(base)
     clean_summary = (summary or "").replace("\n", " ").strip()
 
     if available <= 0:
-        condensed_bits = [f"Price: {_safe_money_str(current_price)}", f"1d: {_safe_percent_str(pct_change_1d)}"]
-        condensed = " | ".join(condensed_bits)
-        base = f"{header}\n\n{intro}\n\n{condensed}\n\n"
-        available = max_len - len(base) - len(summary_prefix)
+        base = f"{header}\nAI Summary Of Mentions:\n"
+        available = max_len - len(base)
 
     if available < 20:
-        base = f"{header}\n{intro}\n"
-        available = max_len - len(base) - len(summary_prefix)
+        base = f"{header}\nAI Summary Of Mentions:\n"
+        available = max_len - len(base)
 
     if available <= 0:
         available = 0
@@ -75,7 +78,7 @@ def build_tweet_text(ticker,
         else:
             clean_summary = clean_summary[:available - 1].rstrip() + "…"
 
-    tweet = f"{base}{summary_prefix}{clean_summary}"
+    tweet = f"{base}{clean_summary}"
     if len(tweet) > 280:
         tweet = tweet[:279] + "…"
     return tweet

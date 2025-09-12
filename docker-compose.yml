@@ -30,6 +30,21 @@ services:
       timeout: 5s
       retries: 3
 
+  reddit_crypto:
+    build: .
+    container_name: reddit_crypto
+    restart: always
+    env_file: anthill.env
+    environment:
+      SERVICE_NAME: reddit_crypto
+      SUBREDDITS_CONFIG_PATH: config/reddit_crypto.subreddits.yml
+    command: ["python","-m","services.reddit_crypto.main"]
+    healthcheck:
+      test: ["CMD","python","-c","import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   stocktwits:
     build: .
     container_name: stocktwits
@@ -52,6 +67,21 @@ services:
     environment:
       SERVICE_NAME: fourchan
     command: ["python","-m","services.fourchan.main"]
+    healthcheck:
+      test: ["CMD","python","-c","import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  fourchan_crypto:
+    build: .
+    container_name: fourchan_crypto
+    restart: always
+    env_file: anthill.env
+    environment:
+      SERVICE_NAME: fourchan_crypto
+      FOURCHAN_BOARDS: biz
+    command: ["python","-m","services.fourchan_crypto.main"]
     healthcheck:
       test: ["CMD","python","-c","import sys; sys.exit(0)"]
       interval: 30s
