@@ -17,6 +17,7 @@ from openai import OpenAI, APIError
 
 from core.config import Settings
 from core.logging import info, err
+from core.ambiguity import BLACKLISTED_TICKERS
 # Note: ambiguous words handling removed for crypto; tickers must be explicit ($ or ALL-CAPS)
 
 
@@ -300,7 +301,23 @@ def process_comment(
 	if not mentions:
 		return  # No potential mentions found
 	
-	# STEP 2: LLM classification for each mention
+	# STEP 2: Apply blacklist filtering before any LLM calls
+	if mentions:
+		filtered: List[Tuple[int, str, str]] = []
+		excluded_symbols: List[str] = []
+		for asset_id, sym, mention_text in mentions:
+			canon = (asset_id_to_ticker.get(asset_id, sym) or "").upper()
+			if canon in BLACKLISTED_TICKERS:
+				excluded_symbols.append(canon)
+				continue
+			filtered.append((asset_id, sym, mention_text))
+		if excluded_symbols:
+			info("mentions_excluded_blacklist", symbols=sorted(list(set(excluded_symbols))), count=len(excluded_symbols))
+		mentions = filtered
+	if not mentions:
+		return
+
+	# STEP 3: LLM classification for each mention
 	kept: List[Tuple[int, str, str]] = []
 	sentiments: Dict[int, int] = {}
 	sentiment_labels: Dict[int, str] = {}
@@ -314,7 +331,7 @@ def process_comment(
 	if not kept:
 		return
 	
-	# STEP 3: Prepare database insert data
+	# STEP 4: Prepare database insert data
 	created = datetime.fromtimestamp(float(comment.created_utc), tz=timezone.utc)
 	link = f"https://reddit.com{getattr(comment, 'permalink', '')}"
 	src_name = f"/r/{getattr(getattr(comment, 'subreddit', None), 'display_name', '').strip()}".lower()
@@ -323,14 +340,14 @@ def process_comment(
 		err("unknown_source", src=src_name)
 		return
 	
-	# STEP 4: Insert to database (dedupe to one row per asset per comment)
+	# STEP 5: Insert to database (dedupe to one row per asset per comment)
 	inserted_asset_ids: List[int] = []
 	for asset_id in {aid for (aid, _, _) in kept}:
 		sent = sentiments[asset_id]
 		insert_comment(conn, asset_id, source_id, created, sent, body, link)
 		inserted_asset_ids.append(asset_id)
 	
-	# STEP 5: Log successful inserts with sentiment decisions
+	# STEP 6: Log successful inserts with sentiment decisions
 	tickers = sorted({ asset_id_to_ticker.get(aid, "") for aid in inserted_asset_ids if asset_id_to_ticker.get(aid) })
 	preview = body[:220] + ("..." if len(body) > 220 else "")
 	decisions = {asset_id_to_ticker.get(aid, ""): sentiment_labels.get(aid, "") for aid in inserted_asset_ids if asset_id_to_ticker.get(aid)}

@@ -13,6 +13,7 @@ from openai import OpenAI, APIError
 
 from core.config import Settings
 from core.logging import info, err
+from core.ambiguity import BLACKLISTED_TICKERS
 
 
 def clean_html_to_text(s: str) -> str:
@@ -235,15 +236,16 @@ def process_post(
 		return 0, 0
 
 	mentions = list(set(iter_mentions(body, alias_to_asset, ticker_to_asset, multi_alias_index, aliases_equal_ticker)))
-	# Filter out excluded tickers (compare against canonical ticker uppercased)
-	exclude = {t.strip().upper() for t in Settings().FOURCHAN_EXCLUDE_TICKERS.split(',') if t.strip()}
+	# Filter out excluded tickers (env + global blacklist)
+	env_exclude = {t.strip().upper() for t in Settings().FOURCHAN_EXCLUDE_TICKERS.split(',') if t.strip()}
+	combined_exclude = env_exclude | BLACKLISTED_TICKERS
 	if mentions:
 		filtered: List[Tuple[int, str, str]] = []
 		excluded_symbols: List[str] = []
 		for asset_id, sym, mention_text in mentions:
-			sym_uc = (sym or "").upper()
-			if sym_uc in exclude:
-				excluded_symbols.append(sym_uc)
+			canon = (asset_id_to_ticker.get(asset_id, sym) or "").upper()
+			if canon in combined_exclude:
+				excluded_symbols.append(canon)
 				continue
 			filtered.append((asset_id, sym, mention_text))
 		if excluded_symbols:
