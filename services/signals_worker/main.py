@@ -329,13 +329,12 @@ def calculate_signals(conn, as_of: datetime, baseline_lookback_windows: int):
     logging.info(f"Calculating signals for window: [{window_start.isoformat()}, {as_of.isoformat()})")
 
     with conn.cursor() as cur:
-        # 1. Get comment counts per asset in the window (stock universe only).
+        # 1. Get comment counts per asset in the window (all universes: stock + crypto).
         cur.execute("""
             SELECT c.asset_id, COUNT(*) AS x_asset_2h
             FROM comments c
             JOIN assets a ON a.id = c.asset_id
             WHERE c.commented_at >= %s AND c.commented_at < %s
-              AND a.universe = 'stock'
             GROUP BY c.asset_id;
         """, (window_start, as_of))
         asset_counts = cur.fetchall()
@@ -436,6 +435,47 @@ def get_asset_details(conn, asset_ids):
     with conn.cursor() as cur:
         cur.execute("SELECT id, ticker, name, universe FROM assets WHERE id = ANY(%s);", (asset_ids,))
         return {row['id']: {'ticker': row['ticker'], 'name': row['name'], 'universe': row['universe']} for row in cur.fetchall()}
+
+def fetch_alert_recipient_emails(conn, universe: str) -> list[str]:
+    """Returns distinct subscriber emails for the given universe from Project-Ape DB."""
+    if universe not in ("stock", "crypto"):
+        return []
+    column = 'enable_stock_surge' if universe == 'stock' else 'enable_crypto_surge'
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT DISTINCT u.email
+            FROM user_alert_prefs p
+            JOIN users u ON u.id = p.user_id
+            WHERE u.email IS NOT NULL
+              AND u.deleted_at IS NULL
+              AND p.{column} = TRUE
+            """
+        )
+        rows = cur.fetchall()
+        emails = [r['email'] for r in rows if r.get('email')]
+        # Basic dedupe and sanitation
+        return sorted(list({e.strip().lower() for e in emails if isinstance(e, str)}))
+
+def fetch_tiingo_crypto_price(ticker: str, token: str) -> float | None:
+    """Fetch current crypto price in USD via Tiingo crypto endpoint using pair {ticker}usd."""
+    try:
+        pair = f"{ticker.lower()}usd"
+        url = "https://api.tiingo.com/tiingo/crypto/prices"
+        params = {"tickers": pair, "token": token}
+        resp = requests.get(url, params=params, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list) and data:
+            # Tiingo returns list per ticker with 'priceData' entries
+            price_data = data[0].get('priceData') or []
+            if price_data:
+                last = price_data[-1].get('last') or price_data[-1].get('close')
+                if last is not None:
+                    return round(float(last), 6)
+    except Exception as e:
+        logging.info(f"Tiingo crypto price fetch failed for {ticker}: {e}")
+    return None
 
 def fetch_comments_for_summary(conn, asset_id: int, start_time: datetime, end_time: datetime, limit: int = 50):
     """Fetches the most recent comment bodies for a given asset in a time window."""
@@ -682,7 +722,7 @@ def process_alerts(conn, signal_rows, config, openai_client):
             
             asset_url = f"{config['frontend_base_url']}/dashboard/symbol/{ticker}?universe={asset.get('universe', 'stock')}"
 
-            # Price performance (equities)
+            # Price performance (equities/crypto)
             pct_change_1d = None
             pct_change_7d = None
             current_price = None
@@ -695,6 +735,9 @@ def process_alerts(conn, signal_rows, config, openai_client):
                     current_price = get_current_price_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
                     yh, yl = fetch_52wk_high_low_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
                     year_high, year_low = yh, yl
+                elif asset.get('universe') == 'crypto' and config.get('tiingo_api_key'):
+                    # Basic crypto price; omit pct changes for now
+                    current_price = fetch_tiingo_crypto_price(ticker, config['tiingo_api_key'])
             except Exception as e:
                 logging.warning(f"Price change computation failed for {ticker}: {e}")
 
@@ -733,13 +776,29 @@ def process_alerts(conn, signal_rows, config, openai_client):
             </div>
             """
 
+            # Resolve dynamic recipients based on user Alert Prefs
+            recipients = []
+            try:
+                recipients = fetch_alert_recipient_emails(conn, asset.get('universe', 'stock'))
+            except Exception as e:
+                logging.error(f"Failed recipient lookup: {e}", exc_info=True)
+                recipients = []
+
+            if not recipients:
+                logging.info(f"No subscribers for alert: universe={asset.get('universe')} ticker={ticker}. Skipping send.")
+                continue
+
+            # Build email with per-recipient personalizations (recipients do not see each other)
             message = Mail(
-                from_email=('alerts@monkeemath.com', 'Project Ape Alerts'), # Matching test-send.js
-                to_emails=config['alerts_to_email'],
+                from_email=('alerts@monkeemath.com', 'Monkeemath Alerts'),
+                to_emails=recipients,
                 subject=subject,
-                html_content=body
+                html_content=body,
+                is_multiple=True,
             )
-            
+
+            logging.info(f"Fanout: universe={asset.get('universe')} ticker={ticker} recipient_count={len(recipients)}")
+
             try:
                 sg = SendGridAPIClient(config['sendgrid_api_key'])
                 response = sg.send(message)
@@ -803,7 +862,6 @@ def main():
         config = {
             "database_url": get_env_var("POSTGRES_URL"),
             "sendgrid_api_key": get_env_var("SENDGRID_API_KEY"),
-            "alerts_to_email": get_env_var("ALERTS_TO_EMAIL"),
             "frontend_base_url": get_env_var("FRONTEND_BASE_URL", "https://project-ape-3u1s.vercel.app"),
             "openai_api_key": get_env_var("OPENAI_API_KEY"),
             "openai_model": get_env_var("OPENAI_MODEL", "gpt-4-turbo"),
