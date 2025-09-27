@@ -97,3 +97,33 @@ services:
       SERVICE_NAME: signals_worker
     command: ["python", "-m", "services.signals_worker.main"]
 
+  signals_worker_24h_stock:
+    build: .
+    container_name: signals_worker_24h_stock
+    restart: always
+    env_file: anthill.env
+    environment:
+      SERVICE_NAME: signals_worker_24h_stock
+      UNIVERSE: stock
+    command: ["python", "-m", "services.signals_worker_24h.main"]
+    healthcheck:
+      test: ["CMD","python","-c","import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  signals_worker_24h_crypto:
+    build: .
+    container_name: signals_worker_24h_crypto
+    restart: always
+    env_file: anthill.env
+    environment:
+      SERVICE_NAME: signals_worker_24h_crypto
+      UNIVERSE: crypto
+    command: ["python", "-m", "services.signals_worker_24h.main"]
+    healthcheck:
+      test: ["CMD","python","-c","import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+

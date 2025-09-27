@@ -9,7 +9,6 @@ import requests
 import math
 from requests_oauthlib import OAuth1
 try:
-    # Prefer precise NYSE holiday calendar if available
     from holidays.financial import NYSE as _HolidayProvider  # type: ignore
     _HOLIDAY_PROVIDER = _HolidayProvider()
 except Exception:
@@ -26,13 +25,10 @@ from psycopg.types.json import Jsonb
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 from openai import OpenAI
-import math
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def get_env_var(name, default=None):
-    """Gets an environment variable or returns a default."""
     value = os.getenv(name, default)
     if value is None:
         raise ValueError(f"Environment variable {name} not set.")
@@ -40,7 +36,6 @@ def get_env_var(name, default=None):
 
 @contextmanager
 def get_db_connection(db_url: str):
-    """Provides a database connection."""
     conn = None
     try:
         conn = psycopg.connect(db_url, row_factory=dict_row)
@@ -57,7 +52,6 @@ def get_db_connection(db_url: str):
 
 @contextmanager
 def advisory_lock(conn, lock_name):
-    """Acquires a Postgres advisory lock for the duration of the context."""
     lock_acquired = False
     try:
         with conn.cursor() as cur:
@@ -77,7 +71,6 @@ def advisory_lock(conn, lock_name):
                 logging.info(f"Released lock: {lock_name}")
 
 def setup_heartbeat_table(conn):
-    """Ensures the job_heartbeats table exists."""
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS job_heartbeats (
@@ -89,7 +82,6 @@ def setup_heartbeat_table(conn):
     logging.info("job_heartbeats table checked/created.")
 
 def update_heartbeat(conn, job_name: str, status: str, error_message: str | None = None):
-    """Updates the heartbeat for a job."""
     with conn.cursor() as cur:
         if status == "ok":
             cur.execute("""
@@ -106,10 +98,6 @@ def update_heartbeat(conn, job_name: str, status: str, error_message: str | None
     logging.info(f"Heartbeat updated for {job_name} with status: {status}")
 
 def is_us_market_holiday(now_utc: datetime) -> bool:
-    """Returns True if today is a US stock market holiday (best-effort).
-
-    Uses NYSE calendar when available, otherwise falls back to US federal holidays.
-    """
     if _HOLIDAY_PROVIDER is None:
         return False
     try:
@@ -120,7 +108,6 @@ def is_us_market_holiday(now_utc: datetime) -> bool:
         return False
 
 def is_us_equity_market_hours(now_utc: datetime) -> bool:
-    """Approximate US equity regular hours: 09:30–16:00 ET on weekdays (no holiday calendar)."""
     try:
         now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
     except Exception:
@@ -139,10 +126,6 @@ def is_us_equity_market_hours(now_utc: datetime) -> bool:
     return is_open
 
 def fetch_tiingo_intraday_snapshot(ticker: str, token: str) -> dict | None:
-    """Fetches intraday snapshot from Tiingo IEX endpoint for a single ticker.
-
-    Returns a dict with keys 'last' and 'prevClose' if available.
-    """
     url = "https://api.tiingo.com/iex"
     params = {"tickers": ticker, "token": token}
     try:
@@ -158,71 +141,49 @@ def fetch_tiingo_intraday_snapshot(ticker: str, token: str) -> dict | None:
                 "yearHigh": row.get("yearHigh"),
                 "yearLow": row.get("yearLow"),
             }
-            logging.info(f"Tiingo intraday snapshot {ticker}: last={result['last']} prevClose={result['prevClose']} yearHigh={result['yearHigh']} yearLow={result['yearLow']}")
             return result
     except Exception as e:
         logging.warning(f"Tiingo intraday snapshot failed for {ticker}: {e}")
     return None
 
 def fetch_tiingo_eod_prices(ticker: str, start_date: str, end_date: str, token: str) -> list[dict]:
-    """Fetch Tiingo EOD daily prices for [start_date, end_date]. Returns list of bars sorted by date."""
     url = f"https://api.tiingo.com/tiingo/daily/{ticker}/prices"
     params = {"startDate": start_date, "endDate": end_date, "token": token}
     try:
-        logging.info(f"Tiingo EOD request for {ticker}: {start_date} -> {end_date}")
         resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, list):
-            logging.info(f"Tiingo EOD received {len(data)} bars for {ticker}")
             return data
     except Exception as e:
         logging.warning(f"Tiingo EOD fetch failed for {ticker}: {e}")
     return []
 
 def compute_pct_change_1d_equity(ticker: str, now_utc: datetime, token: str) -> float | None:
-    """Computes 1-day % change for equities using intraday when appropriate else EOD closes.
-
-    Rules:
-    - If market hours and intraday delta indicates a real move, use (last - prevClose)/prevClose*100
-    - Otherwise, compute using last two adjusted EOD closes
-    Returns a rounded float (2 decimals) or None if unavailable.
-    """
     try:
         if is_us_equity_market_hours(now_utc):
             snap = fetch_tiingo_intraday_snapshot(ticker, token)
             if snap and snap.get("last") is not None and snap.get("prevClose") not in (None, 0):
                 last = float(snap["last"])  # most recent trade price
                 prev_close = float(snap["prevClose"])  # previous trading day's close
-                # "real move" check: ignore if essentially unchanged
                 delta = last - prev_close
-                logging.info(f"1d calc (intraday) {ticker}: last={last} prevClose={prev_close} delta={delta}")
                 if abs(delta) >= max(0.01, 0.0005 * prev_close):
                     pct = (last - prev_close) / prev_close * 100.0
-                    logging.info(f"1d calc (intraday) {ticker}: pct={pct}")
                     return round(pct, 2)
-
-        # Fallback to EOD closes (also used outside market hours)
         end_dt = now_utc.date()
         start_dt = end_dt - timedelta(days=10)
         bars = fetch_tiingo_eod_prices(ticker, start_dt.isoformat(), end_dt.isoformat(), token)
-        # Use adjusted closes from the last two trading days
         closes = [b.get("adjClose") for b in bars if b.get("adjClose") is not None]
         if len(closes) >= 2:
             prev, last = closes[-2], closes[-1]
             if prev not in (None, 0):
                 pct = (last - prev) / prev * 100.0
-                logging.info(f"1d calc (EOD) {ticker}: prev={prev} last={last} pct={pct}")
                 return round(pct, 2)
     except Exception as e:
         logging.warning(f"Failed 1d change calc for {ticker}: {e}")
     return None
 
 def compute_pct_change_7d_equity(ticker: str, now_utc: datetime, token: str) -> float | None:
-    """Computes 7-day % change using adjusted EOD closes, choosing the closest earlier trading day ~7 days prior.
-
-    Returns a rounded float (2 decimals) or None if unavailable.
-    """
     try:
         end_dt = now_utc.date()
         start_dt = end_dt - timedelta(days=14)
@@ -230,26 +191,21 @@ def compute_pct_change_7d_equity(ticker: str, now_utc: datetime, token: str) -> 
         bars = fetch_tiingo_eod_prices(ticker, start_dt.isoformat(), end_dt.isoformat(), token)
         if not bars:
             return None
-        # Ensure sorted by date ascending
         try:
             bars.sort(key=lambda b: b.get("date", ""))
         except Exception:
             pass
-        # Map date->adjClose
         eod = []
         for b in bars:
             adj = b.get("adjClose")
             d = b.get("date")
             if adj is None or d is None:
                 continue
-            # Tiingo dates like 2024-08-09T00:00:00.000Z -> take date part
             d_str = d[:10]
             eod.append((d_str, float(adj)))
         if not eod:
             return None
-        # latest close
         last_date, last_close = eod[-1]
-        # find closest earlier trading day to target_dt
         target_str = target_dt.isoformat()
         candidate = None
         for d_str, c in reversed(eod):
@@ -257,25 +213,21 @@ def compute_pct_change_7d_equity(ticker: str, now_utc: datetime, token: str) -> 
                 candidate = (d_str, c)
                 break
         if candidate is None:
-            # no earlier trading day; take earliest available
             candidate = eod[0]
         prev_date, prev_close = candidate
         if prev_close in (None, 0):
             return None
         pct = (last_close - prev_close) / prev_close * 100.0
-        logging.info(f"7d calc {ticker}: last=({last_date},{last_close}) prev=({prev_date},{prev_close}) pct={pct}")
         return round(pct, 2)
     except Exception as e:
         logging.warning(f"Failed 7d change calc for {ticker}: {e}")
     return None
 
 def get_current_price_equity(ticker: str, now_utc: datetime, token: str) -> float | None:
-    """Gets the current price: use intraday last when available, otherwise last EOD adjClose."""
     try:
         snap = fetch_tiingo_intraday_snapshot(ticker, token)
         if snap and snap.get("last") is not None:
             price = float(snap["last"])
-            logging.info(f"Current price (intraday) {ticker}: {price}")
             return round(price, 2)
         end_dt = now_utc.date()
         start_dt = end_dt - timedelta(days=10)
@@ -283,182 +235,12 @@ def get_current_price_equity(ticker: str, now_utc: datetime, token: str) -> floa
         closes = [b.get("adjClose") for b in bars if b.get("adjClose") is not None]
         if closes:
             price = float(closes[-1])
-            logging.info(f"Current price (EOD) {ticker}: {price}")
             return round(price, 2)
     except Exception as e:
         logging.warning(f"Failed current price for {ticker}: {e}")
     return None
 
-def fetch_52wk_high_low_equity(ticker: str, now_utc: datetime, token: str) -> tuple[float | None, float | None]:
-    """Returns (yearHigh, yearLow) if available; falls back to computing from ~370 days EOD adjClose."""
-    try:
-        snap = fetch_tiingo_intraday_snapshot(ticker, token)
-        yh = snap.get("yearHigh") if snap else None
-        yl = snap.get("yearLow") if snap else None
-        if yh is not None and yl is not None:
-            try:
-                yh_f = round(float(yh), 2)
-                yl_f = round(float(yl), 2)
-                logging.info(f"52w from snapshot {ticker}: high={yh_f} low={yl_f}")
-                return yh_f, yl_f
-            except Exception:
-                pass
-    except Exception as e:
-        logging.info(f"Snapshot lacked 52w range for {ticker}: {e}")
-
-    try:
-        end_dt = now_utc.date()
-        start_dt = end_dt - timedelta(days=370)
-        bars = fetch_tiingo_eod_prices(ticker, start_dt.isoformat(), end_dt.isoformat(), token)
-        closes = [float(b.get("adjClose")) for b in bars if b.get("adjClose") is not None]
-        if closes:
-            yh_f = round(max(closes), 2)
-            yl_f = round(min(closes), 2)
-            logging.info(f"52w from EOD {ticker}: high={yh_f} low={yl_f}")
-            return yh_f, yl_f
-    except Exception as e:
-        logging.warning(f"Failed 52w calc for {ticker}: {e}")
-    return None, None
-
-def calculate_signals(conn, as_of: datetime, baseline_lookback_windows: int, window_hours: int):
-    """
-    Computes Share-of-Voice (SoV) signals for a rolling window of size `window_hours`.
-    """
-    window_start = as_of - timedelta(hours=window_hours)
-    
-    logging.info(f"Calculating signals for window: [{window_start.isoformat()}, {as_of.isoformat()})")
-
-    with conn.cursor() as cur:
-        # 1. Get comment counts per asset in the window (all universes: stock + crypto).
-        cur.execute("""
-            SELECT c.asset_id, COUNT(*) AS x_asset_2h
-            FROM comments c
-            JOIN assets a ON a.id = c.asset_id
-            WHERE c.commented_at >= %s AND c.commented_at < %s
-            GROUP BY c.asset_id;
-        """, (window_start, as_of))
-        asset_counts = cur.fetchall()
-        logging.info(f"Found mentions for {len(asset_counts)} assets in the window.")
-
-        if not asset_counts:
-            logging.info("No comments found in the current window.")
-            return []
-
-        # 2. Calculate total mentions in the window.
-        x_total_2h = sum(row['x_asset_2h'] for row in asset_counts)
-        logging.info(f"Total mentions across all assets (x_total_2h): {x_total_2h}")
-        if x_total_2h == 0:
-            logging.info("Total mentions are zero for the current window.")
-            return []
-
-        signals_to_insert = []
-        asset_ids_with_activity = [row['asset_id'] for row in asset_counts]
-
-        # 3. Fetch historical SoV for baseline calculation
-        cur.execute("""
-            SELECT asset_id, sov_now FROM asset_signal_windows
-            WHERE asset_id = ANY(%s) AND window_hours = %s AND as_of < %s
-            ORDER BY as_of DESC
-            LIMIT %s;
-        """, (asset_ids_with_activity, window_hours, as_of, baseline_lookback_windows * len(asset_ids_with_activity)))
-        
-        history = {}
-        logging.info("Fetching historical SoV data for baseline calculation...")
-        for row in cur.fetchall():
-            if row['asset_id'] not in history:
-                history[row['asset_id']] = []
-            history[row['asset_id']].append(float(row['sov_now']))
-        logging.info(f"Fetched historical data for {len(history)} assets.")
-
-        for i, row in enumerate(asset_counts):
-            asset_id = row['asset_id']
-            x_asset_2h = row['x_asset_2h']
-            
-            # 4. Calculate current SoV
-            sov_now = x_asset_2h / x_total_2h if x_total_2h > 0 else 0
-
-            # 5. Calculate baseline and Z-score
-            mu_sov, sigma_sov, z_sov = 0.0, 0.0, None
-            asset_history = history.get(asset_id, [])
-            
-            if len(asset_history) >= 1: # Need at least one previous window for a baseline
-                mu_sov = np.mean(asset_history)
-                sigma_sov = np.std(asset_history) # Population stddev
-                
-                if sigma_sov > 0:
-                    z_sov = (sov_now - mu_sov) / sigma_sov
-            
-            if i < 3: # Log first 3 calculations for inspection
-                logging.info(f"  -> Asset {asset_id}: x_asset_2h={x_asset_2h}, sov_now={sov_now:.4f}, mu_sov={mu_sov:.4f}, sigma_sov={sigma_sov:.4f}, z_sov={z_sov if z_sov is None else f'{z_sov:.2f}'} (from {len(asset_history)} prior windows)")
-
-            signals_to_insert.append({
-                'asset_id': asset_id,
-                'as_of': as_of,
-                'window_hours': window_hours,
-                'x_asset_2h': x_asset_2h,
-                'x_total_2h': x_total_2h,
-                'sov_now': str(sov_now),
-                'mu_sov': str(mu_sov),
-                'sigma_sov': str(sigma_sov),
-                'z_sov': str(z_sov) if z_sov is not None else None
-            })
-
-        # 6. Upsert results into asset_signal_windows
-        if signals_to_insert:
-            upsert_sql = """
-                INSERT INTO asset_signal_windows (
-                    asset_id, as_of, window_hours, x_asset_2h, x_total_2h, 
-                    sov_now, mu_sov, sigma_sov, z_sov
-                )
-                VALUES (
-                    %(asset_id)s, %(as_of)s, %(window_hours)s, %(x_asset_2h)s, %(x_total_2h)s,
-                    %(sov_now)s, %(mu_sov)s, %(sigma_sov)s, %(z_sov)s
-                )
-                ON CONFLICT (asset_id, as_of, window_hours) DO UPDATE SET
-                    x_asset_2h = EXCLUDED.x_asset_2h,
-                    x_total_2h = EXCLUDED.x_total_2h,
-                    sov_now = EXCLUDED.sov_now,
-                    mu_sov = EXCLUDED.mu_sov,
-                    sigma_sov = EXCLUDED.sigma_sov,
-                    z_sov = EXCLUDED.z_sov;
-            """
-            cur.executemany(upsert_sql, signals_to_insert)
-            logging.info(f"Upserted {len(signals_to_insert)} signal rows.")
-
-    # Return the newly computed signals for the alerts step
-    return signals_to_insert
-
-def get_asset_details(conn, asset_ids):
-    """Fetches asset tickers, names, and universe for a list of asset IDs."""
-    if not asset_ids:
-        return {}
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, ticker, name, universe FROM assets WHERE id = ANY(%s);", (asset_ids,))
-        return {row['id']: {'ticker': row['ticker'], 'name': row['name'], 'universe': row['universe']} for row in cur.fetchall()}
-
-def fetch_alert_recipient_emails(conn, universe: str) -> list[str]:
-    """Returns distinct subscriber emails for the given universe from Project-Ape DB."""
-    if universe not in ("stock", "crypto"):
-        return []
-    column = 'enable_stock_surge' if universe == 'stock' else 'enable_crypto_surge'
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT DISTINCT u.email
-            FROM user_alert_prefs p
-            JOIN users u ON u.id = p.user_id
-            WHERE u.email IS NOT NULL
-              AND u.deleted_at IS NULL
-              AND p.{column} = TRUE
-            """
-        )
-        rows = cur.fetchall()
-        emails = [r['email'] for r in rows if r.get('email')]
-        # Basic dedupe and sanitation
-        return sorted(list({e.strip().lower() for e in emails if isinstance(e, str)}))
-
 def fetch_tiingo_crypto_price(ticker: str, token: str) -> float | None:
-    """Fetch current crypto price in USD via Tiingo crypto endpoint using pair {ticker}usd."""
     try:
         pair = f"{ticker.lower()}usd"
         url = "https://api.tiingo.com/tiingo/crypto/prices"
@@ -467,7 +249,6 @@ def fetch_tiingo_crypto_price(ticker: str, token: str) -> float | None:
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, list) and data:
-            # Tiingo returns list per ticker with 'priceData' entries
             price_data = data[0].get('priceData') or []
             if price_data:
                 last = price_data[-1].get('last') or price_data[-1].get('close')
@@ -478,7 +259,6 @@ def fetch_tiingo_crypto_price(ticker: str, token: str) -> float | None:
     return None
 
 def fetch_comments_for_summary(conn, asset_id: int, start_time: datetime, end_time: datetime, limit: int = 50):
-    """Fetches the most recent comment bodies for a given asset in a time window."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT body FROM comments
@@ -489,17 +269,12 @@ def fetch_comments_for_summary(conn, asset_id: int, start_time: datetime, end_ti
         return [row['body'] for row in cur.fetchall() if row['body']]
 
 def generate_summary(client: OpenAI, model: str, comments: list[str], ticker: str) -> str:
-    """Generates a summary of comments using an LLM."""
     if not comments:
         return "No comments available for summary."
-
-    # Simple concatenation, but truncate to avoid excessive token usage.
-    # A more advanced implementation might be more selective.
     context = "\n".join(comments)
-    max_context_len = 8000 # Rough character limit to keep tokens reasonable
+    max_context_len = 8000
     if len(context) > max_context_len:
         context = context[:max_context_len]
-
     prompt = f"""
         The following are recent comments from social media about the stock ${ticker}.
         Please provide a neutral summary that highlights:
@@ -527,14 +302,6 @@ def generate_summary(client: OpenAI, model: str, comments: list[str], ticker: st
         logging.error(f"Failed to generate summary for ${ticker}: {e}", exc_info=True)
         return "Summary generation failed due to an error."
 
-def _safe_percent_str(value: float | None) -> str:
-    try:
-        if value is None:
-            return "N/A"
-        return f"{value:.2f}%"
-    except Exception:
-        return "N/A"
-
 def _safe_money_str(value: float | None) -> str:
     try:
         if value is None:
@@ -553,23 +320,19 @@ def _safe_percent_signed(value: float | None) -> str:
         return "N/A"
 
 def build_tweet_text_full(ticker: str,
-                         company_name: str,
-                         summary: str,
-                         current_price: float | None,
-                         pct_change_1d: float | None,
-                         pct_change_7d: float | None,
-                         year_high: float | None,
-                         year_low: float | None,
-                         window_label: str = "2h") -> str:
-    """Builds a full-length tweet (no 280-char truncation)."""
+                          company_name: str,
+                          summary: str,
+                          current_price: float | None,
+                          pct_change_1d: float | None,
+                          pct_change_7d: float | None,
+                          year_high: float | None,
+                          year_low: float | None,
+                          window_label: str = "24h") -> str:
     header = f"🚨 Mention Spike Alert: ${ticker}"
     subheader = "We monitor Reddit, 4Chan, StockTwits and Twitter for unusual surges in mentions and sentiment using GPT5."
     current_price_line = f"Current Price: {_safe_money_str(current_price)}"
     daily_change_line = f"Daily Change: {_safe_percent_signed(pct_change_1d)}"
-    if year_high is not None and year_low is not None:
-        wk52_line = f"52 Week H/L: {_safe_money_str(year_high)} - {_safe_money_str(year_low)}"
-    else:
-        wk52_line = "52 Week H/L: N/A"
+    wk52_line = f"52 Week H/L: {_safe_money_str(year_high)} - {_safe_money_str(year_low)}" if year_high is not None and year_low is not None else "52 Week H/L: N/A"
     summary_header = "AI Summary Of Mentions:"
     clean_summary = (summary or "").strip()
     return (
@@ -584,25 +347,19 @@ def build_tweet_text_full(ticker: str,
     )
 
 def build_tweet_text(ticker: str,
-                    company_name: str,
-                    summary: str,
-                    current_price: float | None,
-                    pct_change_1d: float | None,
-                    pct_change_7d: float | None,
-                    year_high: float | None,
-                    year_low: float | None,
-                    window_label: str = "2h") -> str:
-    """Builds a tweet within 280 characters based on the email alert content."""
+                     company_name: str,
+                     summary: str,
+                     current_price: float | None,
+                     pct_change_1d: float | None,
+                     pct_change_7d: float | None,
+                     year_high: float | None,
+                     year_low: float | None,
+                     window_label: str = "24h") -> str:
     header = f"🚨 Mention Spike Alert: ${ticker}"
     subheader = "We monitor Reddit, 4Chan, StockTwits and Twitter for unusual surges in mentions and sentiment using GPT5."
     current_price_line = f"Current Price: {_safe_money_str(current_price)}"
     daily_change_line = f"Daily Change: {_safe_percent_signed(pct_change_1d)}"
-    if year_high is not None and year_low is not None:
-        wk52_line = f"52 Week H/L: {_safe_money_str(year_high)} - {_safe_money_str(year_low)}"
-    else:
-        wk52_line = "52 Week H/L: N/A"
-
-    # Base without summary
+    wk52_line = f"52 Week H/L: {_safe_money_str(year_high)} - {_safe_money_str(year_low)}" if year_high is not None and year_low is not None else "52 Week H/L: N/A"
     base = (
         f"{header}\n\n"
         f"{subheader}\n\n"
@@ -612,129 +369,161 @@ def build_tweet_text(ticker: str,
         f"{wk52_line}\n\n"
         f"AI Summary Of Mentions:\n"
     )
-
-    # compute available chars for summary
     max_len = 280
     available = max_len - len(base)
     clean_summary = summary.replace("\n", " ").strip()
-
     if available <= 0:
-        # try to condense price_line by removing 52w then 7d if needed
-        base = (
-            f"{header}\n{current_price_line}\n{daily_change_line}\n\nAI Summary Of Mentions:\n"
-        )
-        available = max_len - len(base)
-
-    # final fallback: ensure at least some space for summary
-    if available < 20:
-        # minimal format
         base = f"{header}\nAI Summary Of Mentions:\n"
         available = max_len - len(base)
-
     if available <= 0:
         available = 0
-
     if len(clean_summary) > available:
-        if available <= 1:
-            clean_summary = "…"
-        else:
-            clean_summary = clean_summary[:available - 1].rstrip() + "…"
-
+        clean_summary = clean_summary[:max(0, available - 1)].rstrip() + ("…" if available > 0 else "")
     tweet = f"{base}{clean_summary}"
-    # Safety clamp
     if len(tweet) > 280:
         tweet = tweet[:279] + "…"
     return tweet
 
-def post_tweet(text: str, config: dict) -> bool:
-    """Posts a tweet using Twitter API v2 and OAuth 1.0a credentials."""
-    try:
-        ck = config.get('twitter_consumer_key')
-        cs = config.get('twitter_consumer_secret')
-        at = config.get('twitter_access_token')
-        ats = config.get('twitter_access_secret')
-        if not all([ck, cs, at, ats]):
-            logging.warning("Twitter posting skipped: missing credentials.")
-            return False
+def calculate_signals(conn, as_of: datetime, baseline_lookback_windows: int, window_hours: int, universe: str):
+    window_start = as_of - timedelta(hours=window_hours)
+    logging.info(f"Calculating signals for window: [{window_start.isoformat()}, {as_of.isoformat()})")
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.asset_id, COUNT(*) AS x_asset_2h
+            FROM comments c
+            JOIN assets a ON a.id = c.asset_id
+            WHERE a.universe = %s AND c.commented_at >= %s AND c.commented_at < %s
+            GROUP BY c.asset_id;
+        """, (universe, window_start, as_of))
+        asset_counts = cur.fetchall()
+        if not asset_counts:
+            logging.info("No comments found in the current window.")
+            return []
+        x_total_2h = sum(row['x_asset_2h'] for row in asset_counts)
+        if x_total_2h == 0:
+            logging.info("Total mentions are zero for the current window.")
+            return []
+        signals_to_insert = []
+        asset_ids_with_activity = [row['asset_id'] for row in asset_counts]
+        cur.execute("""
+            SELECT asset_id, sov_now FROM asset_signal_windows
+            WHERE asset_id = ANY(%s) AND window_hours = %s AND as_of < %s
+            ORDER BY as_of DESC
+            LIMIT %s;
+        """, (asset_ids_with_activity, window_hours, as_of, baseline_lookback_windows * len(asset_ids_with_activity)))
+        history = {}
+        for row in cur.fetchall():
+            if row['asset_id'] not in history:
+                history[row['asset_id']] = []
+            history[row['asset_id']].append(float(row['sov_now']))
+        for row in asset_counts:
+            asset_id = row['asset_id']
+            x_asset_2h = row['x_asset_2h']
+            sov_now = x_asset_2h / x_total_2h if x_total_2h > 0 else 0
+            mu_sov, sigma_sov, z_sov = 0.0, 0.0, None
+            asset_history = history.get(asset_id, [])
+            if len(asset_history) >= 1:
+                mu_sov = np.mean(asset_history)
+                sigma_sov = np.std(asset_history)
+                if sigma_sov > 0:
+                    z_sov = (sov_now - mu_sov) / sigma_sov
+            signals_to_insert.append({
+                'asset_id': asset_id,
+                'as_of': as_of,
+                'window_hours': window_hours,
+                'x_asset_2h': x_asset_2h,
+                'x_total_2h': x_total_2h,
+                'sov_now': str(sov_now),
+                'mu_sov': str(mu_sov),
+                'sigma_sov': str(sigma_sov),
+                'z_sov': str(z_sov) if z_sov is not None else None
+            })
+        if signals_to_insert:
+            upsert_sql = """
+                INSERT INTO asset_signal_windows (
+                    asset_id, as_of, window_hours, x_asset_2h, x_total_2h, 
+                    sov_now, mu_sov, sigma_sov, z_sov
+                )
+                VALUES (
+                    %(asset_id)s, %(as_of)s, %(window_hours)s, %(x_asset_2h)s, %(x_total_2h)s,
+                    %(sov_now)s, %(mu_sov)s, %(sigma_sov)s, %(z_sov)s
+                )
+                ON CONFLICT (asset_id, as_of, window_hours) DO UPDATE SET
+                    x_asset_2h = EXCLUDED.x_asset_2h,
+                    x_total_2h = EXCLUDED.x_total_2h,
+                    sov_now = EXCLUDED.sov_now,
+                    mu_sov = EXCLUDED.mu_sov,
+                    sigma_sov = EXCLUDED.sigma_sov,
+                    z_sov = EXCLUDED.z_sov;
+            """
+            with conn.cursor() as cur2:
+                cur2.executemany(upsert_sql, signals_to_insert)
+        return signals_to_insert
 
-        url = "https://api.twitter.com/2/tweets"
-        auth = OAuth1(ck, cs, at, ats)
-        payload = {"text": text}
-        resp = requests.post(url, json=payload, auth=auth, timeout=10)
-        if 200 <= resp.status_code < 300:
-            logging.info("Tweet posted successfully.")
-            return True
-        logging.error(f"Failed to post tweet. Status={resp.status_code} Body={resp.text}")
-        return False
-    except Exception as e:
-        logging.error(f"Error while posting tweet: {e}", exc_info=True)
-        return False
+def get_asset_details(conn, asset_ids):
+    if not asset_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, ticker, name, universe FROM assets WHERE id = ANY(%s);", (asset_ids,))
+        return {row['id']: {'ticker': row['ticker'], 'name': row['name'], 'universe': row['universe']} for row in cur.fetchall()}
 
-def process_alerts(conn, signal_rows, config, openai_client, window_hours: int):
-    """
-    Processes signals to generate alerts based on thresholds and cooldowns.
-    """
+def fetch_alert_recipient_emails(conn, universe: str) -> list[str]:
+    if universe not in ("stock", "crypto"):
+        return []
+    column = 'enable_stock_surge' if universe == 'stock' else 'enable_crypto_surge'
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT DISTINCT u.email
+            FROM user_alert_prefs p
+            JOIN users u ON u.id = p.user_id
+            WHERE u.email IS NOT NULL
+              AND u.deleted_at IS NULL
+              AND p.{column} = TRUE
+            """
+        )
+        rows = cur.fetchall()
+        emails = [r['email'] for r in rows if r.get('email')]
+        return sorted(list({e.strip().lower() for e in emails if isinstance(e, str)}))
+
+def process_alerts(conn, signal_rows, config, openai_client, window_hours: int, universe: str):
     if not signal_rows:
         return
-
-    MAX_ALERTS_PER_RUN = 5  # Temporary cap to prevent email floods
+    MAX_ALERTS_PER_RUN = 5
     alerts_sent_this_run = 0
-
     asset_ids = [row['asset_id'] for row in signal_rows]
     asset_details = get_asset_details(conn, asset_ids)
-
     for row in signal_rows:
         try:
             z_sov = float(row['z_sov']) if row['z_sov'] is not None else -1.0
             x_total_2h = int(row['x_total_2h'])
             x_asset_2h = int(row['x_asset_2h'])
             as_of_dt = row['as_of']
-            
-            # 1. Apply floors
-            min_total = config['alert_min_total_2h']
-            min_asset = config['alert_min_asset_2h']
-            if window_hours == 24:
-                try:
-                    min_total = int(os.getenv('ALERT_MIN_TOTAL_24H') or min_total)
-                    min_asset = int(os.getenv('ALERT_MIN_ASSET_24H') or min_asset)
-                except Exception:
-                    pass
+            min_total = int(os.getenv('ALERT_MIN_TOTAL_24H') or config.get('alert_min_total_2h') or 50)
+            min_asset = int(os.getenv('ALERT_MIN_ASSET_24H') or config.get('alert_min_asset_2h') or 5)
             if not (
                 x_total_2h >= min_total and
                 x_asset_2h >= min_asset and
                 row['z_sov'] is not None and z_sov >= config['alert_z_sov_threshold']
             ):
                 continue
-            
-            # 2. Check cooldown/dedupe
             as_of_epoch = int(as_of_dt.timestamp())
             cooldown_bucket = math.floor(as_of_epoch / (config['alert_cooldown_hours'] * 3600))
             dedupe_key = f"{row['asset_id']}|{window_hours}|{cooldown_bucket}"
-            
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 FROM alerts_emitted WHERE dedupe_key = %s;", (dedupe_key,))
                 if cur.fetchone():
                     logging.info(f"Skipping alert for asset {row['asset_id']} due to cooldown (key: {dedupe_key}).")
                     continue
-            
-            # Temporary cap to avoid email floods during testing
             if alerts_sent_this_run >= MAX_ALERTS_PER_RUN:
                 logging.warning(f"Max alerts per run ({MAX_ALERTS_PER_RUN}) reached. Skipping remaining alerts for this cycle.")
                 break
-
-            # 3. Send email
             asset = asset_details.get(row['asset_id'], {})
             ticker = asset.get('ticker', f"ID:{row['asset_id']}")
-            
-            # Fetch comments and generate summary
             comments = fetch_comments_for_summary(conn, row['asset_id'], as_of_dt - timedelta(hours=window_hours), as_of_dt)
             summary = generate_summary(openai_client, config['openai_model'], comments, ticker)
-
             subject = f"Mention Spike Alert ({window_hours}h): ${ticker}"
-            
             asset_url = f"{config['frontend_base_url']}/dashboard/symbol/{ticker}?universe={asset.get('universe', 'stock')}"
-
-            # Price performance (equities/crypto)
             pct_change_1d = None
             pct_change_7d = None
             current_price = None
@@ -745,14 +534,12 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int):
                     pct_change_1d = compute_pct_change_1d_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
                     pct_change_7d = compute_pct_change_7d_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
                     current_price = get_current_price_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
-                    yh, yl = fetch_52wk_high_low_equity(ticker, as_of_dt if isinstance(as_of_dt, datetime) else datetime.now(timezone.utc), config['tiingo_api_key'])
+                    yh, yl = None, None
                     year_high, year_low = yh, yl
                 elif asset.get('universe') == 'crypto' and config.get('tiingo_api_key'):
-                    # Basic crypto price; omit pct changes for now
                     current_price = fetch_tiingo_crypto_price(ticker, config['tiingo_api_key'])
             except Exception as e:
                 logging.warning(f"Price change computation failed for {ticker}: {e}")
-
             body = f"""
             <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #ddd; border-radius: 8px; padding: 20px;">
                 <h2 style="color: #1a1a1a; border-bottom: 2px solid #eee; padding-bottom: 10px;">Mention Spike Alert ({window_hours}h): ${ticker}</h2>
@@ -775,11 +562,8 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int):
 
                 <h4 style="color: #333; margin-top: 20px;">Price Performance</h4>
                 <table style="width: 100%; border-collapse: collapse;">
-                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">Current Price</td><td style="padding: 8px; text-align: right;">{(f"${current_price:.2f}" if current_price is not None else "N/A")}</td></tr>
-                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">1d Change</td><td style="padding: 8px; text-align: right;">{(f"{pct_change_1d:.2f}%" if pct_change_1d is not None else "N/A")}</td></tr>
-                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">7d Change</td><td style="padding: 8px; text-align: right;">{(f"{pct_change_7d:.2f}%" if pct_change_7d is not None else "N/A")}</td></tr>
-                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">52-Week High</td><td style="padding: 8px; text-align: right;">{(f"${year_high:.2f}" if year_high is not None else "N/A")}</td></tr>
-                    <tr><td style="padding: 8px;">52-Week Low</td><td style="padding: 8px; text-align: right;">{(f"${year_low:.2f}" if year_low is not None else "N/A")}</td></tr>
+                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">Current Price</td><td style="padding: 8px; text-align: right;">{(_safe_money_str(current_price))}</td></tr>
+                    <tr style="border-bottom: 1px solid #eee;"><td style="padding: 8px;">1d Change</td><td style="padding: 8px; text-align: right;">{(_safe_percent_signed(pct_change_1d))}</td></tr>
                 </table>
 
                 <div style="text-align: center; margin-top: 25px;">
@@ -787,20 +571,14 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int):
                 </div>
             </div>
             """
-
-            # Resolve dynamic recipients based on user Alert Prefs
-            recipients = []
             try:
-                recipients = fetch_alert_recipient_emails(conn, asset.get('universe', 'stock'))
+                recipients = fetch_alert_recipient_emails(conn, universe)
             except Exception as e:
                 logging.error(f"Failed recipient lookup: {e}", exc_info=True)
                 recipients = []
-
             if not recipients:
                 logging.info(f"No subscribers for alert: universe={asset.get('universe')} ticker={ticker}. Skipping send.")
                 continue
-
-            # Build email with per-recipient personalizations (recipients do not see each other)
             message = Mail(
                 from_email=('alerts@monkeemath.com', 'Monkeemath Alerts'),
                 to_emails=recipients,
@@ -808,9 +586,6 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int):
                 html_content=body,
                 is_multiple=True,
             )
-
-            logging.info(f"Fanout: universe={asset.get('universe')} ticker={ticker} recipient_count={len(recipients)}")
-
             try:
                 sg = SendGridAPIClient(config['sendgrid_api_key'])
                 response = sg.send(message)
@@ -818,9 +593,7 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int):
                 alerts_sent_this_run += 1
             except Exception as e:
                 logging.error(f"Failed to send email for asset {row['asset_id']}: {e}", exc_info=True)
-                continue # Do not record if email failed
-
-            # 3b. Optional: Tweet the alert
+                continue
             try:
                 if config.get('twitter_enabled'):
                     full_tweet = build_tweet_text_full(
@@ -836,8 +609,6 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int):
                     )
                     posted = post_tweet(full_tweet, config)
                     if not posted:
-                        # Fallback to truncated variant
-                        logging.warning(f"Full-length tweet failed, attempting truncated tweet for {ticker}.")
                         short_tweet = build_tweet_text(
                             ticker=ticker,
                             company_name=f"{asset.get('name', ticker)} (${ticker})",
@@ -852,26 +623,40 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int):
                         post_tweet(short_tweet, config)
             except Exception as e:
                 logging.error(f"Failed tweeting alert for {ticker}: {e}", exc_info=True)
-
-            # 4. Record the alert
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO alerts_emitted (asset_id, window_hours, as_of, z_reported, dedupe_key)
                     VALUES (%s, %s, %s, %s, %s);
                 """, (row['asset_id'], window_hours, as_of_dt, str(z_sov), dedupe_key))
-            
-            logging.info(f"Alert for asset {row['asset_id']} recorded in alerts_emitted.")
-            
         except (ValueError, TypeError) as e:
             logging.error(f"Error processing signal row for alert: {row}. Error: {e}", exc_info=True)
             continue
     logging.info(f"Finished processing alerts. Total emails sent: {alerts_sent_this_run}")
-            
-def main():
-    """Main function for the signals worker."""
-    logging.info("Starting signals worker...")
 
-    # Load configuration from environment variables
+def post_tweet(text: str, config: dict) -> bool:
+    try:
+        ck = config.get('twitter_consumer_key')
+        cs = config.get('twitter_consumer_secret')
+        at = config.get('twitter_access_token')
+        ats = config.get('twitter_access_secret')
+        if not all([ck, cs, at, ats]):
+            logging.warning("Twitter posting skipped: missing credentials.")
+            return False
+        url = "https://api.twitter.com/2/tweets"
+        auth = OAuth1(ck, cs, at, ats)
+        payload = {"text": text}
+        resp = requests.post(url, json=payload, auth=auth, timeout=10)
+        if 200 <= resp.status_code < 300:
+            logging.info("Tweet posted successfully.")
+            return True
+        logging.error(f"Failed to post tweet. Status={resp.status_code} Body={resp.text}")
+        return False
+    except Exception as e:
+        logging.error(f"Error while posting tweet: {e}", exc_info=True)
+        return False
+
+def main():
+    logging.info("Starting signals worker 24h...")
     try:
         config = {
             "database_url": get_env_var("POSTGRES_URL"),
@@ -886,7 +671,6 @@ def main():
             "baseline_min_windows": int(get_env_var("BASELINE_MIN_WINDOWS", "12")),
             "baseline_lookback_windows": int(get_env_var("BASELINE_LOOKBACK_WINDOWS", "48")),
             "tiingo_api_key": os.getenv("TIINGO_API_KEY"),
-            # Twitter
             "twitter_enabled": get_env_var("TWITTER_ENABLED", "false").lower() in ("1", "true", "yes"),
             "twitter_consumer_key": os.getenv("TWITTER_CONSUMER_KEY"),
             "twitter_consumer_secret": os.getenv("TWITTER_CONSUMER_SECRET"),
@@ -899,7 +683,6 @@ def main():
 
     openai_client = OpenAI(api_key=config['openai_api_key'])
 
-    # One-time setup: ensure heartbeat table exists
     try:
         with get_db_connection(config['database_url']) as conn:
             setup_heartbeat_table(conn)
@@ -907,45 +690,47 @@ def main():
         logging.error(f"Failed to set up heartbeat table: {e}", exc_info=True)
         return
 
+    # Universe selection (required)
+    universe = os.getenv("UNIVERSE", "stock").strip().lower()
+    if universe not in ("stock", "crypto"):
+        logging.error("UNIVERSE must be 'stock' or 'crypto'")
+        return
+
+    # Backfill is intentionally excluded here. Use the one-off script in services/backfill_24h/.
+
     while True:
         now_utc = datetime.now(timezone.utc)
-        # Align to the top of the next hour
         next_hour = (now_utc + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        sleep_seconds = (next_hour - now_utc).total_seconds() + random.uniform(-1, 1) # Add jitter
-        logging.info(f"Next run at {next_hour.isoformat()}. Sleeping for {sleep_seconds:.2f} seconds.")
+        # run only on even hours (2h cadence)
+        if next_hour.hour % 2 != 0:
+            # sleep to next even hour
+            next_hour = next_hour + timedelta(hours=1)
+        sleep_seconds = (next_hour - now_utc).total_seconds() + random.uniform(-1, 1)
+        logging.info(f"Next run at {next_hour.isoformat()} (24h). Sleeping for {sleep_seconds:.2f} seconds.")
         time.sleep(sleep_seconds)
         as_of = next_hour
-        logging.info(f"Worker tick. Processing for as_of={as_of.isoformat()}")
-
+        logging.info(f"Worker tick 24h. Processing for as_of={as_of.isoformat()}")
         try:
             with get_db_connection(config['database_url']) as conn:
-                with advisory_lock(conn, 'sov_signals_2h') as locked:
+                with advisory_lock(conn, f'sov_signals_24h_{universe}') as locked:
                     if not locked:
-                        continue # Skip cycle if lock not acquired
-
-                    # 1. Signals step
-                    logging.info("Running signals step...")
-                    signal_rows = calculate_signals(conn, as_of, config['baseline_lookback_windows'], 2)
-
-                    # 2. Alerts step
-                    logging.info("Running alerts step...")
-                    process_alerts(conn, signal_rows, config, openai_client, 2)
-
-                    # 3. Heartbeat
-                    logging.info("Updating heartbeat...")
-                    update_heartbeat(conn, "sov_signals_2h", "ok")
-
-                    logging.info("Cycle completed successfully.")
-
+                        continue
+                    logging.info("Running signals step (24h)...")
+                    signal_rows = calculate_signals(conn, as_of, config['baseline_lookback_windows'], 24, universe)
+                    logging.info("Running alerts step (24h)...")
+                    process_alerts(conn, signal_rows, config, openai_client, 24, universe)
+                    logging.info("Updating heartbeat 24h...")
+                    update_heartbeat(conn, f"sov_signals_24h_{universe}", "ok")
+                    logging.info("Cycle completed successfully (24h).")
         except Exception as e:
-            logging.error(f"Error in worker cycle: {e}", exc_info=True)
+            logging.error(f"Error in worker cycle 24h: {e}", exc_info=True)
             try:
                 with get_db_connection(config['database_url']) as conn:
-                    update_heartbeat(conn, "sov_signals_2h", "error", str(e))
+                    update_heartbeat(conn, f"sov_signals_24h_{universe}", "error", str(e))
             except Exception as he:
                 logging.error(f"Failed to write error heartbeat: {he}", exc_info=True)
 
-        # continue loop normally
-
 if __name__ == "__main__":
     main()
+
+
