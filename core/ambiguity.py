@@ -24,6 +24,8 @@ AMBIGUOUS_TICKER_WORDS: Set[str] = set(
 BLACKLISTED_TICKERS: Set[str] = set([
     "A",
     "S",
+    "THE",
+    "DD",
 ])
 
 
