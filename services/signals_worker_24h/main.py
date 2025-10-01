@@ -500,7 +500,7 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int, 
             x_asset_2h = int(row['x_asset_2h'])
             as_of_dt = row['as_of']
             min_total = int(os.getenv('ALERT_MIN_TOTAL_24H') or config.get('alert_min_total_2h') or 50)
-            min_asset = int(os.getenv('ALERT_MIN_ASSET_24H') or config.get('alert_min_asset_2h') or 5)
+            min_asset = int(os.getenv('ALERT_MIN_ASSET_24H') or config.get('alert_min_asset_2h') or 125)
             if not (
                 x_total_2h >= min_total and
                 x_asset_2h >= min_asset and
@@ -665,7 +665,7 @@ def main():
             "openai_api_key": get_env_var("OPENAI_API_KEY"),
             "openai_model": get_env_var("OPENAI_MODEL", "gpt-4-turbo"),
             "alert_min_total_2h": int(get_env_var("ALERT_MIN_TOTAL_2H", "50")),
-            "alert_min_asset_2h": int(get_env_var("ALERT_MIN_ASSET_2H", "5")),
+            "alert_min_asset_2h": int(get_env_var("ALERT_MIN_ASSET_2H", "125")),
             "alert_z_sov_threshold": float(get_env_var("ALERT_Z_SOV_THRESHOLD", "2.5")),
             "alert_cooldown_hours": int(get_env_var("ALERT_COOLDOWN_HOURS", "6")),
             "baseline_min_windows": int(get_env_var("BASELINE_MIN_WINDOWS", "12")),
