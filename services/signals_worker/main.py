@@ -702,7 +702,7 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int):
             if not (
                 x_total_2h >= min_total and
                 x_asset_2h >= min_asset and
-                row['z_sov'] is not None and z_sov >= config['alert_z_sov_threshold']
+                row['z_sov'] is not None and z_sov >= 50
             ):
                 continue
             

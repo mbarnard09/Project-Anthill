@@ -499,12 +499,12 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int, 
             x_total_2h = int(row['x_total_2h'])
             x_asset_2h = int(row['x_asset_2h'])
             as_of_dt = row['as_of']
-            min_total = int(os.getenv('ALERT_MIN_TOTAL_24H') or config.get('alert_min_total_2h') or 50)
-            min_asset = int(os.getenv('ALERT_MIN_ASSET_24H') or config.get('alert_min_asset_2h') or 125)
+            min_total = 1000
+            min_asset = 125
             if not (
                 x_total_2h >= min_total and
                 x_asset_2h >= min_asset and
-                row['z_sov'] is not None and z_sov >= config['alert_z_sov_threshold']
+                row['z_sov'] is not None and z_sov >= 50.0
             ):
                 continue
             as_of_epoch = int(as_of_dt.timestamp())
