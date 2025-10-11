@@ -25,9 +25,8 @@ class Settings(BaseSettings):
     # Path to YAML file with a list of subreddits for the service
     SUBREDDITS_CONFIG_PATH: str = os.getenv("SUBREDDITS_CONFIG_PATH", "config/reddit1.subreddits.yml")
 
-    # OpenAI
-    OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+    # DeepSeek only
+    DEEPSEEK_API_KEY: str | None = os.getenv("DEEPSEEK_API_KEY", "")
 
     class Config:
         env_file = "anthill.env"

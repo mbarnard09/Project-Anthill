@@ -8,7 +8,8 @@ import re
 
 import asyncpg
 from tenacity import retry, wait_exponential, stop_after_attempt
-from openai import AsyncOpenAI
+
+from core.deepseek import deepseek_chat_async
 
 from core.config import Settings
 from core.logging import info, err
@@ -22,8 +23,8 @@ class StockTwitsScraper:
         # Active symbols (top 1500 by recent mentions)
         self.active_symbols = []
         
-        # Initialize OpenAI client for sentiment fallback
-        self.openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        # DeepSeek API key
+        self.deepseek_api_key = settings.DEEPSEEK_API_KEY
         
         self.source_id = None  # Will be loaded async
         
@@ -111,7 +112,7 @@ class StockTwitsScraper:
             return None
     
     async def score_sentiment_llm(self, symbol: str, message_text: str) -> int:
-        """Use OpenAI to score sentiment when StockTwits doesn't provide it."""
+        """Use DeepSeek to score sentiment when StockTwits doesn't provide it."""
         try:
             # Clean and prepare the message text
             cleaned_text = re.sub(r'[^\w\s$@#.]', ' ', message_text)
@@ -120,24 +121,22 @@ class StockTwitsScraper:
             
             # Minimal sentiment classification prompt
             system_prompt = """Classify sentiment for the stock mentioned in the comment.
-Return exactly one word:
-Bullish (positive, buy, up)
-Bearish (negative, sell, down)
-Neutral (unclear, mixed)"""
+ Return exactly one word:
+ Bullish (positive, buy, up)
+ Bearish (negative, sell, down)
+ Neutral (unclear, mixed)"""
 
             user_prompt = f"SYMBOL: {symbol}\nMESSAGE: {cleaned_text[:500]}"  # Limit length
 
-            response = await self.openai_client.chat.completions.create(
-                model=self.settings.OPENAI_MODEL,
+            decision = (await deepseek_chat_async(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
+                api_key=self.deepseek_api_key,
+                temperature=0,
                 max_tokens=4,
-                temperature=0
-            )
-            
-            decision = response.choices[0].message.content.strip().lower()
+            )).strip().lower()
             
             # Map LLM response to sentiment score (all are guaranteed stocks)
             if "bullish" in decision or "bull" in decision:
@@ -179,8 +178,8 @@ Neutral (unclear, mixed)"""
             else:
                 sentiment_score = 0
         else:
-            # Fall back to ChatGPT sentiment analysis
-            sentiment_source = "chatgpt"
+            # Fall back to DeepSeek sentiment analysis
+            sentiment_source = "deepseek"
             sentiment_score = await self.score_sentiment_llm(symbol_info["symbol"], body)
             
             # Skip if LLM fails (but continue processing)
@@ -276,13 +275,13 @@ Neutral (unclear, mixed)"""
                         
                         # Count sentiment sources
                         stocktwits_count = sum(1 for s in sentiment_sources if s == "stocktwits")
-                        chatgpt_count = sum(1 for s in sentiment_sources if s == "chatgpt")
+                        deepseek_count = sum(1 for s in sentiment_sources if s == "deepseek")
                         error_count = sum(1 for s in sentiment_sources if isinstance(s, Exception))
                         
                         symbol_stats[symbol] = {
                             "total": len(messages),
                             "stocktwits_sentiment": stocktwits_count,
-                            "chatgpt_sentiment": chatgpt_count,
+                            "deepseek_sentiment": deepseek_count,
                             "errors": error_count
                         }
                         total_messages += len(messages)
@@ -291,7 +290,7 @@ Neutral (unclear, mixed)"""
                         info("symbol_complete", symbol=symbol, 
                              messages=len(messages), 
                              stocktwits_sentiment=stocktwits_count,
-                             chatgpt_sentiment=chatgpt_count,
+                             deepseek_sentiment=deepseek_count,
                              processing_time_sec=round(msg_time, 2))
                     
                     # Update cursor
@@ -300,16 +299,16 @@ Neutral (unclear, mixed)"""
                     
                     # Initialize empty stats if no messages processed
                     if symbol not in symbol_stats:
-                        symbol_stats[symbol] = {"total": 0, "stocktwits_sentiment": 0, "chatgpt_sentiment": 0, "errors": 0}
+                        symbol_stats[symbol] = {"total": 0, "stocktwits_sentiment": 0, "deepseek_sentiment": 0, "errors": 0}
                         
                 except Exception as e:
                     err("symbol_error", symbol=symbol, error=str(e))
-                    symbol_stats[symbol] = {"total": 0, "stocktwits_sentiment": 0, "chatgpt_sentiment": 0, "errors": 1}
+                    symbol_stats[symbol] = {"total": 0, "stocktwits_sentiment": 0, "deepseek_sentiment": 0, "errors": 1}
             
             # Calculate aggregate stats
             elapsed_time = time.time() - start_time
             total_stocktwits = sum(stats["stocktwits_sentiment"] for stats in symbol_stats.values())
-            total_chatgpt = sum(stats["chatgpt_sentiment"] for stats in symbol_stats.values()) 
+            total_deepseek = sum(stats["deepseek_sentiment"] for stats in symbol_stats.values()) 
             total_errors = sum(stats["errors"] for stats in symbol_stats.values())
             symbols_with_messages = len([k for k, v in symbol_stats.items() if v["total"] > 0])
             
@@ -319,7 +318,7 @@ Neutral (unclear, mixed)"""
                  symbols_with_messages=symbols_with_messages,
                  total_messages=total_messages,
                  stocktwits_sentiment=total_stocktwits,
-                 chatgpt_sentiment=total_chatgpt,
+                 deepseek_sentiment=total_deepseek,
                  errors=total_errors,
                  elapsed_seconds=round(elapsed_time, 2))
     

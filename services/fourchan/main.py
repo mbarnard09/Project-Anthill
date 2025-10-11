@@ -9,7 +9,7 @@ from psycopg import Connection
 from psycopg import connect
 from psycopg.rows import dict_row
 
-from openai import OpenAI, APIError
+from core.deepseek import deepseek_chat
 
 from core.config import Settings
 from core.logging import info, err
@@ -34,15 +34,12 @@ def clean_text(text: str, max_len: int = 800) -> str:
     return text
 
 
-def score_sentiment_llm(client: OpenAI, model: str, body: str, symbol: str | None, mention: str | None) -> tuple[int, str]:
+def score_sentiment_llm(api_key: str, body: str, symbol: str | None, mention: str | None) -> tuple[int, str]:
     cleaned = clean_text(body)
     symbol_str = symbol or ""
     mention_str = (mention or symbol_str or "").strip()
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=0,
-            max_tokens=4,
+        answer = deepseek_chat(
             messages=[
                 {
                     "role": "system",
@@ -57,18 +54,17 @@ def score_sentiment_llm(client: OpenAI, model: str, body: str, symbol: str | Non
                 },
                 {"role": "user", "content": f"SYMBOL: {symbol_str}\nMENTION: {mention_str}\nCOMMENT: {cleaned}"},
             ],
-        )
-        answer = (resp.choices[0].message.content or "").strip().lower()
+            api_key=api_key,
+            temperature=0,
+            max_tokens=4,
+        ).lower()
         if "bull" in answer:
             return 1, "Bullish"
         if "bear" in answer:
             return -1, "Bearish"
         return 0, "Neutral"
-    except APIError as e:
-        err("openai_api_error", error=str(e), status_code=e.status_code, error_type=e.type)
-        return 0, "Neutral"
     except Exception as e:
-        err("openai_unhandled_error", error=str(e))
+        err("deepseek_unhandled_error", error=str(e))
         return 0, "Neutral"
 
 
@@ -255,8 +251,7 @@ def process_post(
     post: dict,
     board: str,
     conn: Connection,
-    openai_client: OpenAI,
-    model: str,
+    deepseek_api_key: str,
     alias_to_asset: Dict,
     ticker_to_asset: Dict,
     multi_alias_index: Dict,
@@ -316,7 +311,7 @@ def process_post(
     sentiments: Dict[int, int] = {}
     sentiment_labels: Dict[int, str] = {}
     for asset_id, (sym, mention_text) in unique_by_asset.items():
-        sent, sent_label = score_sentiment_llm(openai_client, model, body, sym, mention_text)
+        sent, sent_label = score_sentiment_llm(deepseek_api_key, body, sym, mention_text)
         kept.append((asset_id, sym, mention_text))
         sentiments[asset_id] = sent
         sentiment_labels[asset_id] = sent_label
@@ -342,10 +337,9 @@ def main():
     boards = ["biz"]
     info("fourchan_start", boards=boards, poll_seconds=s.POLL_SECONDS)
 
-    if not s.OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is required")
-    openai_client = OpenAI(api_key=s.OPENAI_API_KEY)
-    model = s.OPENAI_MODEL
+    if not s.DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY is required")
+    deepseek_api_key = s.DEEPSEEK_API_KEY
 
     if not s.DATABASE_URL:
         raise RuntimeError("DATABASE_URL is required")
@@ -421,8 +415,7 @@ def main():
                                     p,
                                     board,
                                     conn,
-                                    openai_client,
-                                    model,
+                                    deepseek_api_key,
                                     alias_to_asset,
                                     ticker_to_asset,
                                     multi_alias_index,

@@ -24,7 +24,7 @@ import numpy as np
 from psycopg.types.json import Jsonb
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
-from openai import OpenAI
+from core.deepseek import deepseek_chat
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -261,43 +261,86 @@ def fetch_tiingo_crypto_price(ticker: str, token: str) -> float | None:
 def fetch_comments_for_summary(conn, asset_id: int, start_time: datetime, end_time: datetime, limit: int = 50):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT body FROM comments
-            WHERE asset_id = %s AND commented_at >= %s AND commented_at < %s
+            SELECT sentiment, body FROM comments
+            WHERE asset_id = %s AND commented_at >= %s AND commented_at < %s AND body IS NOT NULL
             ORDER BY commented_at DESC
             LIMIT %s;
         """, (asset_id, start_time, end_time, limit))
-        return [row['body'] for row in cur.fetchall() if row['body']]
+        rows = cur.fetchall()
+        return [
+            {"sentiment": int(r.get('sentiment') or 0), "body": str(r.get('body') or '')}
+            for r in rows if r.get('body')
+        ]
 
-def generate_summary(client: OpenAI, model: str, comments: list[str], ticker: str) -> str:
-    if not comments:
-        return "No comments available for summary."
-    context = "\n".join(comments)
-    max_context_len = 8000
-    if len(context) > max_context_len:
-        context = context[:max_context_len]
-    prompt = f"""
-        The following are recent comments from social media about the stock ${ticker}.
-        Please provide a neutral summary that highlights:
-        - Key themes and overall sentiment
-        - Potential catalysts for the mention spike, with special attention to any NEWS items or headlines referenced
-        - Notable disagreements or uncertainty if present
-        Keep the response concise but longer if needed to capture material details.
-
-        Comments:
-        ---
-        {context}
-        ---
-        Summary:
-    """
+def generate_summary(deepseek_api_key: str, comments: list[dict], ticker: str, universe: str, hours: int, mention_count: int) -> str:
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=350,
+        system_content = "\n".join([
+            'You are a sharp, conversational market analyst. You receive recent social comments about one stock or crypto.',
+            '',
+            'Your job is to capture the FLAVOR of the chatter (short, readable, trader-friendly):',
+            '1) Summarize the mood in 2–3 tight paragraphs — buzz, momentum shifts, uncertainty.',
+            '2) Surface catalysts: confirmed news, speculative rumors, and repeated themes (bullish + bearish).',
+            '3) Highlight 2–4 especially interesting/representative comments (PARAPHRASED).',
+            '4) If a comment is vague, infer plausible context to make it useful, but LABEL it "(inferred)".',
+            '5) Call out risks/contradictions if they stand out.',
+            '',
+            'Output in Markdown with EXACT sections and spacing:',
+            '',
+            '### Summary',
+            '[2–3 concise paragraphs, focus on mood and buzz]',
+            '',
+            '### Notable Themes & Catalysts',
+            '- Single-line bullets: news, speculation, repeated points; why traders care',
+            '',
+            '### Interesting Comments',
+            '- **Tagline** — Paraphrase with any helpful inference/context (2–4 items total)',
+            '',
+            '### Risks & Contradictions',
+            '- Short bullets with key uncertainties or disagreements',
+            '',
+            'Style rules:',
+            '- Prefer colorful, concrete paraphrase over generic phrasing.',
+            '- Avoid dry stats unless they clarify the chatter.',
+            '- Do NOT quote usernames or paste comments verbatim.',
+        ])
+
+        import re as _re
+        def sanitize(s: str) -> str:
+            return _re.sub(r"[\*`_>#]", "", _re.sub(r"\s+", " ", s)).trim() if hasattr(str, 'trim') else _re.sub(r"[\*`_>#]", "", _re.sub(r"\s+", " ", s)).strip()
+        def truncate(s: str, n: int) -> str:
+            return s[: n - 1] + '…' if len(s) > n else s
+
+        formatted_comments = []
+        for c in (comments or [])[:50]:
+            try:
+                s = int(c.get('sentiment') if isinstance(c, dict) else 0)
+            except Exception:
+                s = 0
+            label = 'pos' if s > 0 else ('neg' if s < 0 else 'neu')
+            body = c.get('body') if isinstance(c, dict) else str(c)
+            formatted_comments.append(f"- [{label}] {truncate(sanitize(body or ''), 240)}")
+        formatted_block = "\n".join(formatted_comments)
+
+        user_content = (
+            f"Context (use exactly the formatting below):\n"
+            f"- Asset: {ticker}\n"
+            f"- Universe: {universe}\n"
+            f"- Timeframe: last {hours} hours\n"
+            f"- Comments ingested: {mention_count}\n\n"
+            + (f"Recent comments (most recent first, do not quote verbatim — paraphrase for clarity):\n{formatted_block}\n\n" if formatted_block else "")
+            + "Task: Produce Markdown per the structure. Include 2–4 items in the \"Interesting Comments\" section (paraphrased, no direct quotes). Use clear bullets (\"- \") and include blank lines between sections so it renders correctly. Be specific and avoid filler."
         )
-        summary = response.choices[0].message.content
-        return summary.strip() if summary else "Could not generate a summary."
+
+        summary = deepseek_chat(
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": user_content},
+            ],
+            api_key=deepseek_api_key,
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        return (summary or "Could not generate a summary.").strip()
     except Exception as e:
         logging.error(f"Failed to generate summary for ${ticker}: {e}", exc_info=True)
         return "Summary generation failed due to an error."
@@ -486,7 +529,7 @@ def fetch_alert_recipient_emails(conn, universe: str) -> list[str]:
         emails = [r['email'] for r in rows if r.get('email')]
         return sorted(list({e.strip().lower() for e in emails if isinstance(e, str)}))
 
-def process_alerts(conn, signal_rows, config, openai_client, window_hours: int, universe: str):
+def process_alerts(conn, signal_rows, config, deepseek_api_key: str, window_hours: int, universe: str):
     if not signal_rows:
         return
     MAX_ALERTS_PER_RUN = 5
@@ -521,7 +564,7 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int, 
             asset = asset_details.get(row['asset_id'], {})
             ticker = asset.get('ticker', f"ID:{row['asset_id']}")
             comments = fetch_comments_for_summary(conn, row['asset_id'], as_of_dt - timedelta(hours=window_hours), as_of_dt)
-            summary = generate_summary(openai_client, config['openai_model'], comments, ticker)
+            summary = generate_summary(deepseek_api_key, comments, ticker, asset.get('universe', 'stock'), window_hours, x_asset_2h)
             subject = f"Mention Spike Alert ({window_hours}h): ${ticker}"
             asset_url = f"{config['frontend_base_url']}/dashboard/symbol/{ticker}?universe={asset.get('universe', 'stock')}"
             pct_change_1d = None
@@ -546,7 +589,7 @@ def process_alerts(conn, signal_rows, config, openai_client, window_hours: int, 
                 <p style="font-size: 16px;">A significant increase in social media mentions has been detected for <strong>{asset.get('name', ticker)} (${ticker})</strong>.</p>
                 
                 <div style="background-color: #f9f9f9; padding: 15px; border-radius: 5px; margin: 20px 0;">
-                    <h4 style="margin-top: 0; color: #333;">ChatGPT Summary of Recent Mentions:</h4>
+                    <h4 style="margin-top: 0; color: #333;">DeepSeek Summary of Recent Mentions:</h4>
                     <p style="font-size: 14px; color: #555;"><em>"{summary}"</em></p>
                 </div>
 
@@ -662,8 +705,7 @@ def main():
             "database_url": get_env_var("POSTGRES_URL"),
             "sendgrid_api_key": get_env_var("SENDGRID_API_KEY"),
             "frontend_base_url": get_env_var("FRONTEND_BASE_URL", "https://project-ape-3u1s.vercel.app"),
-            "openai_api_key": get_env_var("OPENAI_API_KEY"),
-            "openai_model": get_env_var("OPENAI_MODEL", "gpt-4-turbo"),
+            "deepseek_api_key": get_env_var("DEEPSEEK_API_KEY"),
             "alert_min_total_2h": int(get_env_var("ALERT_MIN_TOTAL_2H", "50")),
             "alert_min_asset_2h": int(get_env_var("ALERT_MIN_ASSET_2H", "125")),
             "alert_z_sov_threshold": float(get_env_var("ALERT_Z_SOV_THRESHOLD", "2.5")),
@@ -681,7 +723,7 @@ def main():
         logging.error(f"Configuration error: {e}")
         return
 
-    openai_client = OpenAI(api_key=config['openai_api_key'])
+    deepseek_api_key = config['deepseek_api_key']
 
     try:
         with get_db_connection(config['database_url']) as conn:
@@ -718,7 +760,7 @@ def main():
                     logging.info("Running signals step (24h)...")
                     signal_rows = calculate_signals(conn, as_of, config['baseline_lookback_windows'], 24, universe)
                     logging.info("Running alerts step (24h)...")
-                    process_alerts(conn, signal_rows, config, openai_client, 24, universe)
+                    process_alerts(conn, signal_rows, config, deepseek_api_key, 24, universe)
                     logging.info("Updating heartbeat 24h...")
                     update_heartbeat(conn, f"sov_signals_24h_{universe}", "ok")
                     logging.info("Cycle completed successfully (24h).")
