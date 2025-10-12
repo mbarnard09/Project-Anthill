@@ -127,3 +127,18 @@ services:
       timeout: 5s
       retries: 3
 
+  daily_tweet:
+    build: .
+    container_name: daily_tweet
+    restart: always
+    env_file: anthill.env
+    environment:
+      SERVICE_NAME: daily_tweet
+      DAILY_TWEET_MIN_MENTIONS: 100
+    command: ["python", "-m", "services.daily_tweet.main"]
+    healthcheck:
+      test: ["CMD","python","-c","import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
