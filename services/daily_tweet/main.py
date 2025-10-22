@@ -101,7 +101,7 @@ def post_tweet(text: str, cfg: dict) -> bool:
 
 def fetch_top_bullish_stocks(conn, since_utc: datetime, min_mentions: int = 100) -> list[dict]:
     sql = """
-        WITH window AS (
+        WITH time_window AS (
             SELECT c.asset_id,
                    COUNT(*) AS total,
                    SUM(CASE WHEN c.sentiment = 1 THEN 1 ELSE 0 END) AS pos,
@@ -112,7 +112,7 @@ def fetch_top_bullish_stocks(conn, since_utc: datetime, min_mentions: int = 100)
             WHERE a.universe = 'stock'
               AND c.commented_at >= %s
               AND (
-                s.name LIKE '/r/%' OR s.name IN ('4Chan', 'StockTwits')
+                s.name LIKE '/r/%%' OR s.name IN ('4Chan', 'StockTwits')
               )
             GROUP BY c.asset_id
             HAVING COUNT(*) > %s
@@ -124,7 +124,7 @@ def fetch_top_bullish_stocks(conn, since_utc: datetime, min_mentions: int = 100)
                    CASE WHEN (w.pos + w.neg) > 0
                         THEN 100.0 * w.pos::float / (w.pos + w.neg)
                         ELSE NULL END AS bullish_pct
-            FROM window w
+            FROM time_window w
         )
         SELECT a.id,
                a.ticker,
