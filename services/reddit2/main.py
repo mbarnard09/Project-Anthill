@@ -153,7 +153,7 @@ def iter_mentions(text: str,
     """Fast-path mention detection within one comment.
     
     Detection rules:
-    - Tickers: Accept if $prefixed or ALL-CAPS; ambiguous words require explicit form
+    - Tickers: Accept if $prefixed or ALL-CAPS; ambiguous words require $ prefix
     - Single-word alias==ticker: Enforce ticker rule; other aliases: accept as-is
     - Multi-word aliases: Greedy matching with boundary checks
     
@@ -187,8 +187,8 @@ def iter_mentions(text: str,
         originals = originals_by_lower.get(tok, set()) | originals_by_lower.get(tok_stripped, set())
         
         def is_explicit_symbol(o: str) -> bool:
-            """Check if token is explicitly formatted as stock symbol ($TICKER or ALL-CAPS)."""
-            return o.startswith("$") or (o.isupper() and any(c.isalpha() for c in o))
+            """Check if token is explicitly formatted with $ prefix (for ambiguous tickers)."""
+            return o.startswith("$")
 
         # TICKER DETECTION: Accept all tickers unless they're ambiguous words
         if tok_stripped in ticker_to_asset:
@@ -244,8 +244,13 @@ def iter_mentions(text: str,
                 if re.search(alias_pattern, lower):
                     # If alias equals ticker (single-token case), enforce explicit symbol (rare edge case)
                     if len(alias_tokens) == 1 and alias_tokens[0] in aliases_equal_ticker:
-                        if any(o.startswith("$") or (o.isupper() and any(c.isalpha() for c in o)) for o in originals_by_lower.get(alias_tokens[0], {alias_tokens[0]})):
-                            seen.add((asset_id, sym or alias_tokens[0].upper(), alias_lower))
+                        originals_for_alias = originals_by_lower.get(alias_tokens[0], {alias_tokens[0]})
+                        if alias_tokens[0] in AMBIGUOUS_TICKER_WORDS:
+                            if any(o.startswith("$") for o in originals_for_alias):
+                                seen.add((asset_id, sym or alias_tokens[0].upper(), alias_lower))
+                        else:
+                            if any(o.startswith("$") or (o.isupper() and any(c.isalpha() for c in o)) for o in originals_for_alias):
+                                seen.add((asset_id, sym or alias_tokens[0].upper(), alias_lower))
                     else:
                         # Multi-word alias found (e.g., "service now" -> NOW)
                         seen.add((asset_id, sym or alias_lower, alias_lower))

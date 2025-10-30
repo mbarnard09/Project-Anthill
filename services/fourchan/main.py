@@ -146,7 +146,7 @@ def iter_mentions(
         originals = originals_by_lower.get(tok, set()) | originals_by_lower.get(tok_stripped, set())
 
         def is_explicit_symbol(o: str) -> bool:
-            return o.startswith("$") or (o.isupper() and any(c.isalpha() for c in o))
+            return o.startswith("$")
 
         if tok_stripped in ticker_to_asset:
             if tok_stripped in AMBIGUOUS_TICKER_WORDS:
@@ -190,8 +190,13 @@ def iter_mentions(
                 alias_pattern = r'(?:^|(?<=\s)|(?<=\W))' + re.escape(alias_lower) + r'(?=\s|(?=\W)|$)'
                 if re.search(alias_pattern, lower):
                     if len(alias_tokens) == 1 and alias_tokens[0] in aliases_equal_ticker:
-                        if any(o.startswith("$") or (o.isupper() and any(c.isalpha() for c in o)) for o in originals_by_lower.get(alias_tokens[0], {alias_tokens[0]})):
-                            seen.add((asset_id, sym or alias_tokens[0].upper(), alias_lower))
+                        originals_for_alias = originals_by_lower.get(alias_tokens[0], {alias_tokens[0]})
+                        if alias_tokens[0] in AMBIGUOUS_TICKER_WORDS:
+                            if any(o.startswith("$") for o in originals_for_alias):
+                                seen.add((asset_id, sym or alias_tokens[0].upper(), alias_lower))
+                        else:
+                            if any(o.startswith("$") or (o.isupper() and any(c.isalpha() for c in o)) for o in originals_for_alias):
+                                seen.add((asset_id, sym or alias_tokens[0].upper(), alias_lower))
                     else:
                         seen.add((asset_id, sym or alias_lower, alias_lower))
 

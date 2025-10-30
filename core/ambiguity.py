@@ -2,7 +2,7 @@ from typing import Set
 
 
 # Common English words that are also valid stock tickers. These require
-# explicit mention ($ prefix or ALL-CAPS) to count as ticker/alias.
+# an explicit $-prefixed mention to count as ticker/alias.
 AMBIGUOUS_TICKER_WORDS: Set[str] = set(
     [
         # 1-char
